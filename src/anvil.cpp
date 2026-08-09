@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.5";
+inline const char * ANVIL_VERSION = "0.4.7";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -796,6 +796,7 @@ struct ModelEntry {
     std::string params_json;        // raw Ollama params blob (if any)
     nlohmann::json gguf_meta;       // verbose GGUF header metadata
     ModelProfile profile;
+    bool         seeded = false;    // per-model schema already populated once
 
     nlohmann::json to_json() const {
         return {
@@ -804,7 +805,7 @@ struct ModelEntry {
             {"desc", desc}, {"trained_ctx", trained_ctx},
             {"chat_template", chat_template}, {"license", license},
             {"params_json", params_json}, {"gguf_meta", gguf_meta},
-            {"settings", profile.to_json()},
+            {"settings", profile.to_json()}, {"seeded", seeded},
         };
     }
 
@@ -820,12 +821,60 @@ struct ModelEntry {
         get("source_id", e.source_id); get("size_bytes", e.size_bytes);
         get("added", e.added); get("desc", e.desc); get("trained_ctx", e.trained_ctx);
         get("chat_template", e.chat_template); get("license", e.license);
-        get("params_json", e.params_json);
+        get("params_json", e.params_json); get("seeded", e.seeded);
         if (j.contains("gguf_meta") && j["gguf_meta"].is_object()) e.gguf_meta = j["gguf_meta"];
         if (j.contains("settings")) e.profile = ModelProfile::from_json(j["settings"]);
         return e;
     }
 };
+
+// Every model carries its own individual settings schema, derived from the
+// model's own GGUF header (trained context + converter-recorded sampling
+// params) plus Anvil's recommended stack (TurboQuant KV compression, flash
+// attention). Only fills keys the user hasn't explicitly set, so the setup
+// TUI and `anvil profile <name> set k=v` always win. Returns true when any
+// key was added (used to backfill pre-existing registry entries).
+static bool seed_model_profile(ModelProfile & p, int64_t trained_ctx,
+                               const nlohmann::json & gguf_meta) {
+    bool changed = false;
+    auto fill = [&](const char * k, nlohmann::json v) {
+        if (p.settings.count(k)) return;
+        p.set(k, std::move(v));
+        changed = true;
+    };
+
+    // Full trained context by default. TurboQuant KV compression is what
+    // makes that feasible (e.g. Bonsai-27B @ 262k ctx ≈ 4 GB KV), so we do
+    // not shrink n_ctx to dodge memory — only the absolute sanity cap applies.
+    if (trained_ctx > 0) {
+        fill("n_ctx", static_cast<int>(std::min<int64_t>(trained_ctx, MAX_CTX)));
+    }
+
+    // Model-authored sampling params, when the converter recorded them.
+    auto sval = [&](const char * key) -> std::string {
+        const std::string full = std::string("general.sampling.") + key;
+        if (gguf_meta.is_object() && gguf_meta.contains(full) && gguf_meta[full].is_string()) {
+            return gguf_meta[full].get<std::string>();
+        }
+        return "";
+    };
+    int   iv = 0;
+    float fv = 0.0f;
+    const std::string s_temp   = sval("temp");
+    const std::string s_top_k  = sval("top_k");
+    const std::string s_top_p  = sval("top_p");
+    const std::string s_repeat = sval("repeat_penalty");
+    if (!s_temp.empty()   && parse_float(s_temp, fv) && fv >= 0.0f && fv <= MAX_TEMP) fill("temp", fv);
+    if (!s_top_k.empty()  && parse_int(s_top_k, iv)  && iv > 0 && iv <= MAX_TOP_K)    fill("top_k", iv);
+    if (!s_top_p.empty()  && parse_float(s_top_p, fv) && fv > 0.0f && fv <= 1.0f)     fill("top_p", fv);
+    if (!s_repeat.empty() && parse_float(s_repeat, fv) && fv >= 1.0f && fv <= 100.0f) fill("repeat_penalty", fv);
+
+    // Anvil's recommended stack (same as the setup TUI defaults).
+    fill("flash_attn", true);
+    fill("type_k", std::string("turbo4"));
+    fill("type_v", std::string("turbo3"));
+    return changed;
+}
 
 // ──── src/models.cpp ────
 
@@ -872,6 +921,8 @@ static std::string slugify(const std::string & s) {
     return out;
 }
 
+bool save_models(const std::vector<ModelEntry> & models);
+
 std::vector<ModelEntry> load_models() {
     std::vector<ModelEntry> models;
     std::ifstream f(models_json_path());
@@ -889,6 +940,19 @@ std::vector<ModelEntry> load_models() {
         fprintf(stderr, "\033[33mwarning: %s is unreadable (%s); starting empty\033[0m\n",
                 models_json_path().c_str(), e.what());
     }
+    // Backfill: guarantee every model carries its own individual settings
+    // schema, even entries registered before per-model seeding existed. Runs
+    // exactly once per entry (the `seeded` marker persists), so a user who
+    // later runs `anvil profile <name> unset k` keeps their choice instead of
+    // having the key silently re-seeded on the next load.
+    bool changed = false;
+    for (auto & e : models) {
+        if (e.seeded) continue;
+        if (seed_model_profile(e.profile, e.trained_ctx, e.gguf_meta)) changed = true;
+        e.seeded = true;
+        changed = true;
+    }
+    if (changed) save_models(models);
     return models;
 }
 
@@ -1098,6 +1162,8 @@ ModelEntry * auto_register(std::vector<ModelEntry> & models,
     e.desc = meta.desc;
     e.trained_ctx = meta.trained_ctx;
     e.gguf_meta = meta.gguf_meta;
+    seed_model_profile(e.profile, meta.trained_ctx, meta.gguf_meta);
+    e.seeded = true;
     models.push_back(std::move(e));
     return &models.back();
 }
@@ -1210,6 +1276,8 @@ int cmd_models(const std::vector<std::string> & args) {
         e.desc = meta.desc;
         e.trained_ctx = meta.trained_ctx;
         e.gguf_meta = meta.gguf_meta;
+        seed_model_profile(e.profile, meta.trained_ctx, meta.gguf_meta);
+        e.seeded = true;
         models.push_back(std::move(e));
         if (!save_models(models)) return 1;
         printf("Registered '%s' -> %s\n", name.c_str(), path.c_str());
@@ -1601,6 +1669,8 @@ int register_pulled(const std::string & friendly, const std::string & path,
             }
         }
     }
+    seed_model_profile(e.profile, e.trained_ctx, e.gguf_meta);
+    e.seeded = true;
     models.push_back(std::move(e));
     if (!save_models(models)) return 1;
     printf("\033[32mRegistered '%s' (%s) -> %s\033[0m\n", friendly.c_str(),

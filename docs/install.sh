@@ -191,7 +191,14 @@ git clone --recursive "$REPO_URL" "$SRC_DIR"
 log "Building anvil (this may take a few minutes)..."
 cmake -B "$SRC_DIR/build" -S "$SRC_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$SRC_DIR/build" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)" >/dev/null || die "build failed"
-${PRIV}cp "$SRC_DIR/build/anvil" "$TARGET/anvil" || die "could not copy binary to ${TARGET}"
+BIN_TMP="${TARGET}/.anvil-bin.$$"
+trap 'rm -f "$BIN_TMP" 2>/dev/null' EXIT
+${PRIV}cp "$SRC_DIR/build/anvil" "$BIN_TMP" || die "could not copy binary to ${TARGET}"
+# Atomic rename (not in-place cp): overwriting a downloaded binary in place
+# leaves a stale macOS provenance inode behind, which the kernel SIGKILLs on
+# exec (Killed: 9). rename() gives the target a fresh inode.
+${PRIV}mv "$BIN_TMP" "$TARGET/anvil" || die "could not install binary to ${TARGET}/anvil"
+trap - EXIT
 ${PRIV}chmod +x "$TARGET/anvil"
 log "Built and installed anvil -> ${TARGET}/anvil"
 }
