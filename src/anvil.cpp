@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.3";
+inline const char * ANVIL_VERSION = "0.4.4";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -2764,7 +2764,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
     printf("  temp    : %.2f\n", cfg.temp);
     if (cfg.mtp) printf("  spec    : MTP\n");
     if (grammar_active) printf("  grammar : %s\n", cli.grammar.c_str());
-    printf("  commands: /exit /clear /stats /undo /export /model /temp <f> /ctx\n\n");
+    printf("  commands: /exit /clear /stats /undo /export /model /temp <f> /ctx <n>\n\n");
 
     // Conversation state. history owns every string; the llama_chat_message
     // view is rebuilt fresh for each template call, so no c_str() pointer can
@@ -2916,6 +2916,61 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
         }
     };
 
+    // Recreate the context at a new size and re-decode the conversation so
+    // `/ctx <n>` works mid-session. The fresh context starts empty; we then
+    // re-decode exactly what was in the KV (the template-rendered history),
+    // so subsequent turns keep working incrementally. All downstream lambdas
+    // capture ctx/mem by reference, so swapping both here is sufficient.
+    //
+    // The swap is atomic: everything that can fail (token count vs new size,
+    // context init) is validated BEFORE the old context is freed, so a failed
+    // resize leaves the session fully intact.
+    auto reload_context = [&](uint32_t new_ctx) -> bool {
+        // Tokenize the conversation first (vocab-only; needs no context).
+        std::string formatted;
+        const bool have_render = render_conversation(false, formatted);
+        std::string text;
+        if (have_render && !formatted.empty()) {
+            text = formatted;
+        } else if (!history.empty()) {
+            // No usable chat template: fall back to raw concatenation so the
+            // conversation isn't silently lost on resize. Note: for such
+            // models the next turn takes the raw fallback path anyway, so the
+            // reloaded history only matters until then (pre-existing limit).
+            for (const auto & m : history) text += m.content + "\n";
+        }
+        // Empty session: still resize, but there is nothing to re-decode.
+        std::vector<llama_token> all = tokenize_render(vocab, text);
+        if (!all.empty() && all.size() + (add_bos ? 1u : 0u) > new_ctx) {
+            fprintf(stderr, "\033[31merror: conversation (%zu tokens) does not fit in %u\033[0m\n",
+                    all.size(), new_ctx);
+            return false;   // old context untouched
+        }
+        // Init into a local; only swap in once it is valid.
+        cparams.n_ctx   = new_ctx;
+        cparams.n_batch = new_ctx;
+        LlamaContext new_ctx_obj(llama_init_from_model(model, cparams));
+        if (!new_ctx_obj) {
+            fprintf(stderr, "\033[31merror: failed to recreate context at %u tokens\033[0m\n", new_ctx);
+            return false;   // old context untouched
+        }
+        ctx = std::move(new_ctx_obj);   // frees the old context only now
+        mem = llama_get_memory(ctx);
+        prev_tokens.clear();
+        if (all.empty()) return true;   // nothing to re-decode
+
+        std::vector<llama_token> full;
+        full.reserve(all.size() + 1);
+        if (add_bos && (all.empty() || all[0] != bos_id)) full.push_back(bos_id);
+        full.insert(full.end(), all.begin(), all.end());
+        if (!decode_tokens(full)) {
+            fprintf(stderr, "\033[31merror: failed to re-decode conversation\033[0m\n");
+            return false;
+        }
+        prev_tokens = std::move(all);
+        return true;
+    };
+
     if (cli.prompt.empty()) {
         // ─── Interactive REPL ──────────────────────────────────────────────
         while (true) {
@@ -3023,9 +3078,31 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
                 continue;
             }
 
+            if (user_input.rfind("/ctx ", 0) == 0) {
+                int new_ctx = 0;
+                if (!parse_int(user_input.substr(5), new_ctx) || new_ctx < 1 || new_ctx > MAX_CTX) {
+                    printf("Invalid context size (1..%d).\n\n", MAX_CTX);
+                    continue;
+                }
+                if (static_cast<uint32_t>(new_ctx) == cparams.n_ctx) {
+                    printf("Context is already %d tokens.\n\n", new_ctx);
+                    continue;
+                }
+                if (n_ctx_train > 0 && new_ctx > n_ctx_train) {
+                    printf("\033[33m⚠ %d exceeds trained context (%d); quality may degrade.\033[0m\n",
+                           new_ctx, n_ctx_train);
+                }
+                if (!reload_context(static_cast<uint32_t>(new_ctx))) {
+                    printf("Context left unchanged.\n\n");
+                    continue;
+                }
+                printf("Context resized to %d tokens; conversation reloaded.\n\n", new_ctx);
+                continue;
+            }
+
             if (user_input[0] == '/') {
                 printf("Unknown command: %s\n", user_input.c_str());
-                printf("Available: /exit /clear /stats /undo /export /model /temp <f> /ctx\n\n");
+                printf("Available: /exit /clear /stats /undo /export /model /temp <f> /ctx <n>\n\n");
                 continue;
             }
 
