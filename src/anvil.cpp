@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.2";
+inline const char * ANVIL_VERSION = "0.4.3";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -2587,15 +2587,21 @@ static void export_session(const std::vector<ChatMessage> & msgs, const std::str
 
 // ─── Text helpers ──────────────────────────────────────────────────────────
 
-// Token -> piece with a correctly sized buffer (previous code declared n+1
-// bytes of capacity for an n-byte buffer).
+// Token -> piece. llama_token_to_piece follows the llama.cpp sizing
+// convention: a negative return is the required size (not an error), so a
+// null-buffer probe can never be used to size the buffer. This matches the
+// backend's own token_to_piece_for_cache: start small, resize on negative,
+// retry. (The previous null/0 probe returned negative for every token,
+// silently swallowing all generated text.)
 static std::string token_to_str(const llama_vocab * vocab, llama_token token) {
-    const int n = llama_token_to_piece(vocab, token, nullptr, 0, 0, true);
-    if (n <= 0) return "";
-    std::string s(static_cast<size_t>(n) + 1, '\0');
-    const int written = llama_token_to_piece(vocab, token, s.data(), static_cast<int32_t>(s.size()), 0, true);
-    if (written <= 0) return "";
-    s.resize(static_cast<size_t>(std::min(written, n)));
+    std::string s(16, '\0');
+    int n = llama_token_to_piece(vocab, token, s.data(), static_cast<int32_t>(s.size()), 0, true);
+    if (n < 0) {
+        s.resize(static_cast<size_t>(-n));
+        n = llama_token_to_piece(vocab, token, s.data(), static_cast<int32_t>(s.size()), 0, true);
+    }
+    if (n < 0) n = 0;   // still too small: give up on this piece
+    s.resize(static_cast<size_t>(n));
     return s;
 }
 
