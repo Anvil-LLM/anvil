@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.4";
+inline const char * ANVIL_VERSION = "0.4.5";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -725,6 +725,7 @@ inline std::string models_dir()       { return config_dir() + "/models"; }
 
 // Declared here (defined in hardware.cpp below) because import validates GGUF.
 bool validate_gguf(const std::string & path);
+std::string gguf_check_error(const std::string & path);
 
 struct ModelProfile {
     // Explicitly-set keys only; anything absent inherits the global config.
@@ -1185,7 +1186,7 @@ int cmd_models(const std::vector<std::string> & args) {
             }
         }
         if (!validate_gguf(path)) {
-            fprintf(stderr, "\033[31merror: '%s' is not a valid GGUF file\033[0m\n", path.c_str());
+            fprintf(stderr, "\033[31merror: %s\033[0m\n", gguf_check_error(path).c_str());
             return 1;
         }
         std::error_code ec;
@@ -2346,6 +2347,18 @@ bool validate_gguf(const std::string & path) {
     f.read(magic, 4);
     return f.gcount() == 4 && memcmp(magic, "GGUF", 4) == 0;
 }
+
+// Error message for a failed import/run GGUF check. Distinguishes a missing
+// file (deleted, moved, or a typo'd path) from a real format problem, since
+// both used to say "not a valid GGUF file" and sent users chasing the wrong
+// thing.
+std::string gguf_check_error(const std::string & path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return "'" + path + "': no such file (was it moved or deleted?)";
+    }
+    return "'" + path + "' is not a valid GGUF file (missing GGUF magic; is the download complete?)";
+}
 // ──── src/setup.hpp ────
 
 
@@ -3226,7 +3239,7 @@ int main(int argc, char ** argv) {
         cli.friendly = friendly;
 
         if (!validate_gguf(cli.model)) {
-            fprintf(stderr, "\033[31merror: '%s' is not a valid GGUF file\033[0m\n", cli.model.c_str());
+            fprintf(stderr, "\033[31merror: %s\033[0m\n", gguf_check_error(cli.model).c_str());
             return 1;
         }
     }
@@ -3242,7 +3255,9 @@ int main(int argc, char ** argv) {
     LlamaBackend backend;
 
     AnvilConfig cfg;
+    bool setup_ran = false;
     if (cli.setup || !config_exists()) {
+        setup_ran = true;
         cfg = run_setup_tui(hw, max_ctx);
         cfg.model = cli.model;
         write_config(cfg);
@@ -3290,6 +3305,23 @@ int main(int argc, char ** argv) {
         std::error_code ec;
         const auto sz = std::filesystem::file_size(cli.model, ec);
         if (!ec) entry->size_bytes = sz;
+        // The setup TUI just ran for this model: persist its choices as the
+        // model's individual profile (populated by the user via setup), so
+        // every model keeps its own settings instead of inheriting globals.
+        // Works for imported models and path-run models alike (both get a
+        // registry entry here).
+        if (setup_ran) {
+            ModelProfile & p = entry->profile;
+            p.set("n_ctx", cfg.n_ctx);
+            p.set("ngl", cfg.ngl);
+            p.set("temp", cfg.temp);
+            p.set("flash_attn", cfg.flash_attn);
+            p.set("type_k", kv_type_short(cfg.type_k));
+            p.set("type_v", kv_type_short(cfg.type_v));
+            save_models(models);
+            fprintf(stderr, "Setup saved to profile '%s' (%zu settings)\n",
+                    friendly.c_str(), p.settings.size());
+        }
         entry->profile.apply_to(cfg);
         fprintf(stderr, "Profile '%s': %d setting(s) applied\n", friendly.c_str(),
                 static_cast<int>(entry->profile.settings.size()));
