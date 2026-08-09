@@ -30,6 +30,7 @@
 #include <io.h>          // _isatty, _fileno (POSIX unistd.h does not exist on MSVC)
 #else
 #include <unistd.h>      // isatty, STDIN_FILENO (POSIX)
+#include <sys/ioctl.h>   // TIOCGWINSZ (live-render cursor math)
 #include <glob.h>        // sysfs GPU probe (Linux only, harmless elsewhere)
 #endif
 #ifdef _WIN32
@@ -46,6 +47,7 @@
 #endif
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
+#include "mdtty/mdtty.hpp"
 #include <ftxui/dom/elements.hpp>
 #include <iostream>
 #include <ctime>
@@ -68,7 +70,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.9";
+inline const char * ANVIL_VERSION = "0.5.0";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -296,264 +298,328 @@ struct Utf8Buffer {
 };
 
 // ─── Streaming markdown renderer ──────────────────────────────────────────
-// Renders model output with ANSI styling as tokens stream in. Thinking
-// blocks (<thinking>…</thinking>, 〈think〉…〈/think〉, and variants) become
-// grey "collapsible-tag" blocks; **bold**, *italic*, ~~strike~~, `code`,
-// ```fences```, # headings and > quotes get terminal colors.
+// Model output is styled by the vendored mdtty library (markdown → ANSI):
+// bold/italic/code, fences, headings, quotes, lists, HRs, GFM tables.
+//
+// TTY: a *live redraw* — the full response-so-far is re-rendered through
+// mdtty's one-shot render() every ~35ms and rewritten in place via ANSI
+// cursor math, so tokens appear continuously and formatting pops in the
+// instant a construct completes. If the response outgrows the screen the
+// redraw is abandoned and the same text streams through the stateful
+// renderer instead (no torn output either way).
+//
+// Piped (non-TTY): mdtty's line-buffered streaming renderer emits clean
+// output per completed line, so `-p | head` and log files still stream.
+//
+// Thinking blocks (<thinking>…, 〈think〉…, variants) are split out here (tag
+// detection only — the formatting is mdtty's) and rendered with a dim
+// palette, so reasoning is formatted too, just lighter.
 //
 // Display-only: the caller still stores the raw text (markers and all) in
-// history. Markers can split across token boundaries ("<think" + "ing>"), so
-// a small lookahead holds back anything that could still extend into one.
+// history. A trailing incomplete tag ("<thin" + …) is held back so it never
+// flashes as response text.
 struct MarkdownStream {
-    std::string buf;                  // pending text (may end mid-marker)
-    bool in_think   = false;
-    bool in_fence   = false;
-    bool in_code    = false;
-    bool in_heading = false;
-    bool in_quote   = false;
-    bool bold       = false;
-    bool italic     = false;
-    bool strike     = false;
-    bool at_line_start = true;
-    char fence_char = 0;              // '`' or '~' for the open fence
-    char last_char  = 0;              // last emitted char (for *-italics lookahead)
+    mdtty::Config resp_cfg;         // response palette: mdtty defaults
+    mdtty::Config think_cfg;        // thinking palette: same colors, dimmed block
+    // Stateful streaming renderers (piped output / tall-response fallback).
+    // mdtty auto-strips ANSI when stdout is not a TTY, so piped stays clean.
+    mdtty::Renderer resp_s;
+    mdtty::Renderer think_s;
 
-    static constexpr size_t HOLD_MAX = 12;   // longest marker prefix: "</thinking>"
+    std::string raw;                // live-redraw accumulation (TTY only)
+    std::string pending;            // streaming accumulation (piped / fallback)
+    std::string last_render;        // previous rendered frame (cursor math)
+    size_t rendered_up_to = 0;      // bytes of `raw` already shown (live)
+    bool color = false;             // TTY check, same one mdtty uses internally
+    bool in_think_s = false;        // thinking state for the streaming path
+    bool first = true;              // live: first frame has nothing to erase
+    bool live = true;               // live: redraw-in-place still active
+    std::chrono::steady_clock::time_point last_draw;
 
-    // Complete 2+ char markers. When buf ends with one of these it is fully
-    // decidable — emitting all of it is safe (e.g. "<thinking>" ends in '>',
-    // which alone looks like a quote marker; holding it back would mangle the
-    // tag). Single-char markers ('*', '`') are excluded: they must still be
-    // held in case they extend into '**' or a fence.
-    static bool ends_with_complete_marker(const std::string & b) {
-        static const char * full[] = {
-            "<thinking>", "</thinking>", "<think>", "</think>",
-            "〈thinking〉", "〈/thinking〉", "〈think〉", "〈/think〉",
-            "```", "~~~", "**", "~~", "# ", "> ", "- ", "+ ", "1. ",
-        };
-        for (const char * m : full) {
-            const size_t n = std::strlen(m);
-            if (b.size() >= n && std::strncmp(b.c_str() + b.size() - n, m, n) == 0) return true;
+    static constexpr std::chrono::milliseconds DRAW_MS{35};
+    // Banner/prompt rows above the response: redraw only while the response
+    // (plus that margin) fits on screen, so \033[nA can never clamp/scroll.
+    static constexpr int SCREEN_MARGIN = 8;
+
+    static void sink_out(std::string_view s) {
+        std::fwrite(s.data(), 1, s.size(), stdout);
+        fflush(stdout);
+    }
+
+    MarkdownStream()
+        : resp_s(sink_out, {}), think_s(sink_out, think_config()),
+          color(mdtty::Renderer::is_tty()) {}
+
+    // Thinking palette: keep mdtty's full colors so bold/code/headings stay
+    // visibly formatted, but dim the whole block ("lighter, greyish").
+    // The reset code carries the dim so every span stays in the dim family.
+    static mdtty::Config think_config() {
+        mdtty::Config tc;
+        tc.reset = "\033[0;2m";     // reset + dim: block-wide lighter tone
+        return tc;
+    }
+
+    // ── thinking-tag detection (formatter-agnostic) ──
+    static bool tag_at(const std::string & t, size_t i, bool closing, size_t & len) {
+        static const char * open_[]  = { "<thinking>", "<think>", "〈thinking〉", "〈think〉" };
+        static const char * close_[] = { "</thinking>", "</think>", "〈/thinking〉", "〈/think〉" };
+        const char * const * tags = closing ? close_ : open_;
+        for (size_t k = 0; k < 4; k++) {
+            const size_t n = std::strlen(tags[k]);
+            if (i + n <= t.size() && std::strncmp(tags[k], t.c_str() + i, n) == 0) {
+                len = n;
+                return true;
+            }
         }
         return false;
     }
 
-    // True when `suf` is a proper prefix of some marker (i.e. it might still
-    // extend into one once more input arrives).
-    static bool is_prefix_of_marker(const std::string & suf) {
-        static const char * markers[] = {
-            "<thinking>", "</thinking>", "<think>", "</think>",
-            "〈thinking〉", "〈/thinking〉", "〈think〉", "〈/think〉",
-            "```", "~~~", "**", "~~", "*", "`", "# ", "> ", "- ", "+ ", "1. ",
+    static bool is_tag_prefix(const std::string & s) {
+        static const char * tags[] = {
+            "<thinking>", "<think>", "〈thinking〉", "〈think〉",
+            "</thinking>", "</think>", "〈/thinking〉", "〈/think〉",
         };
-        for (const char * m : markers) {
-            const size_t n = std::strlen(m);
-            if (n > suf.size() && std::strncmp(m, suf.c_str(), suf.size()) == 0) return true;
+        for (const char * tag : tags) {
+            const size_t n = std::strlen(tag);
+            if (n > s.size() && std::strncmp(tag, s.c_str(), s.size()) == 0) return true;
         }
         return false;
     }
 
-    // Longest suffix of buf that could still extend into a marker. If buf
-    // ends with a complete marker, nothing needs holding (see above).
+    // Longest suffix of buf that could still extend into a thinking tag.
     static size_t partial_suffix(const std::string & b) {
-        if (ends_with_complete_marker(b)) return 0;
+        static constexpr size_t HOLD_MAX = 15;   // longest tag: "〈/thinking〉"
         const size_t lim = std::min(b.size(), HOLD_MAX);
-        for (size_t L = lim; L >= 1; L--) {
-            if (is_prefix_of_marker(b.substr(b.size() - L))) return L;
+        for (size_t L = lim; L >= 1; --L) {
+            if (is_tag_prefix(b.substr(b.size() - L))) return L;
         }
         return 0;
     }
 
-    static bool opening_think(const std::string & t, size_t i, size_t & len) {
-        static const char * tags[] = { "<thinking>", "〈thinking〉", "<think>", "〈think〉" };
-        for (const char * tag : tags) {
-            const size_t n = std::strlen(tag);
-            if (i + n <= t.size() && std::strncmp(tag, t.c_str() + i, n) == 0) { len = n; return true; }
-        }
-        return false;
-    }
-
-    static bool closing_think(const std::string & t, size_t i, size_t & len) {
-        static const char * tags[] = { "</thinking>", "〈/thinking〉", "</think>", "〈/think〉" };
-        for (const char * tag : tags) {
-            const size_t n = std::strlen(tag);
-            if (i + n <= t.size() && std::strncmp(tag, t.c_str() + i, n) == 0) { len = n; return true; }
-        }
-        return false;
-    }
-
-    // Reset and re-apply the active style set (so combinations compose).
-    void apply_style() {
-        printf("\033[0m");
-        if (in_think)   printf("\033[90m");        // grey thinking body
-        if (in_fence)   printf("\033[36m");        // cyan code block
-        if (in_code)    printf("\033[36m");        // cyan inline code
-        if (in_heading) printf("\033[1;33m");      // bold gold heading
-        if (in_quote)   printf("\033[2m");         // dim quote
-        if (bold)       printf("\033[1m");
-        if (italic)     printf("\033[3m");
-        if (strike)     printf("\033[9m");
-    }
-
-    void put(char c) {
-        fputc(c, stdout);
-        at_line_start = (c == '\n');
-        last_char = c;
-    }
-
-    void render(const std::string & t) {
-        const size_t n = t.size();
-        for (size_t i = 0; i < n; i++) {
-            const char c = t[i];
-
+    // Split `doc` into response/thinking segments and render each through mdtty.
+    std::string render_all(const std::string & doc) {
+        std::string out, seg;
+        bool in_think = false;
+        auto flush_seg = [&]() {
+            if (seg.empty()) return;
             if (in_think) {
-                size_t cl = 0;
-                if (closing_think(t, i, cl)) {
-                    printf("\033[2;90m└─ /Thinking ─\033[0m\n");
-                    in_think = false;
-                    apply_style();
-                    i += cl - 1;
-                    at_line_start = true;
-                    continue;
-                }
-                put(c);
+                out += color ? "\033[2;90m┌─ Thinking ─\033[0m\n" : "┌─ Thinking ─\n";
+                out += mdtty::Renderer::render(seg, think_cfg);
+                out += color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n";
+            } else {
+                out += mdtty::Renderer::render(seg, resp_cfg);
+            }
+            seg.clear();
+        };
+        size_t i = 0;
+        while (i < doc.size()) {
+            size_t len = 0;
+            if (tag_at(doc, i, true, len)) {           // closing tag
+                if (in_think) { flush_seg(); in_think = false; i += len; continue; }
+                i += len;                              // stray close: swallow
                 continue;
             }
-            if (in_fence) {
-                if (at_line_start && i + 2 < n && t[i] == fence_char &&
-                    t[i + 1] == fence_char && t[i + 2] == fence_char) {
-                    in_fence = false;
-                    printf("\033[0m\n");
-                    i += 2;
-                    at_line_start = true;
-                    continue;
-                }
-                put(c);
-                continue;
-            }
-            if (in_code) {
-                if (c == '`') { in_code = false; apply_style(); continue; }
-                put(c);
-                continue;
-            }
-            if (in_heading) {
-                put(c);
-                if (c == '\n') { in_heading = false; apply_style(); }
-                continue;
-            }
-            if (in_quote) {
-                put(c);
-                if (c == '\n') { in_quote = false; apply_style(); }
-                continue;
-            }
-
-            if (c == '\n') { put(c); continue; }
-
-            if (at_line_start) {
-                // # heading (1-6 hashes followed by a space)
-                if (c == '#') {
-                    size_t h = 0;
-                    while (i + h < n && t[i + h] == '#' && h < 6) h++;
-                    if (i + h < n && t[i + h] == ' ') {
-                        in_heading = true;
-                        printf("\033[1;33m");
-                        i += h;              // hashes hidden; space stays
-                        continue;
-                    }
-                    put(c);
-                    continue;
-                }
-                // > blockquote
-                if (c == '>' && i + 1 < n && t[i + 1] == ' ') {
-                    in_quote = true;
-                    printf("\033[2m");
-                    continue;
-                }
-                // ``` / ~~~ fenced code
-                if ((c == '`' || c == '~') && i + 2 < n && t[i + 1] == c && t[i + 2] == c) {
-                    fence_char = c;
-                    in_fence = true;
-                    printf("\n\033[36m");
-                    i += 2;
-                    at_line_start = false;
-                    continue;
-                }
-                // - / + / * list bullets
-                if (i + 1 < n && t[i + 1] == ' ' && (c == '-' || c == '+' || c == '*')) {
-                    printf("\033[1;36m%c\033[0m", c);
-                    i += 1;
-                    at_line_start = false;
-                    continue;
-                }
-                // numbered lists
-                if (i + 1 < n && t[i + 1] == '.' &&
-                    std::isdigit(static_cast<unsigned char>(c))) {
-                    printf("\033[1;36m%c.\033[0m", c);
-                    i += 1;
-                    at_line_start = false;
-                    continue;
-                }
-            }
-
-            size_t tl = 0;
-            if (opening_think(t, i, tl)) {
-                if (!at_line_start) printf("\n");
-                printf("\033[2;90m┌─ Thinking ─\033[0m\n");
+            if (!in_think && tag_at(doc, i, false, len)) {   // opening tag
+                flush_seg();
                 in_think = true;
-                apply_style();              // grey body
-                i += tl - 1;
-                at_line_start = false;
+                i += len;
                 continue;
             }
-            if (closing_think(t, i, tl)) {  // stray close tag: swallow it
-                i += tl - 1;
-                continue;
-            }
+            seg.push_back(doc[i++]);
+        }
+        flush_seg();
+        return out;
+    }
 
-            if (c == '*' && i + 1 < n && t[i + 1] == '*') {
-                bold = !bold; apply_style(); i += 1; continue;
-            }
-            if (c == '~' && i + 1 < n && t[i + 1] == '~') {
-                strike = !strike; apply_style(); i += 1; continue;
-            }
-            if (c == '`') { in_code = true; apply_style(); continue; }
-            if (c == '*') {
-                // italic unless space-delimited on both sides ("a * b" is a literal star).
-                // last_char spans chunk boundaries, so *italics* split across
-                // tokens still see the correct preceding character.
-                const bool prev_word = last_char != 0 &&
-                    !std::isspace(static_cast<unsigned char>(last_char));
-                const bool next_word = i + 1 < n &&
-                    !std::isspace(static_cast<unsigned char>(t[i + 1]));
-                if (prev_word || next_word) { italic = !italic; apply_style(); }
-                else put(c);
+    // ── terminal plumbing for the in-place redraw ──
+    static int terminal_cols() {
+#if defined(_WIN32)
+        CONSOLE_SCREEN_BUFFER_INFO csbi{};
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0) {
+            const int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            if (w > 0) return w;
+        }
+#else
+        struct winsize ws{};
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+            return static_cast<int>(ws.ws_col);
+        }
+#endif
+        return 80;
+    }
+
+    static int terminal_rows() {
+#if defined(_WIN32)
+        CONSOLE_SCREEN_BUFFER_INFO csbi{};
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0) {
+            const int h = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+            if (h > 0) return h;
+        }
+#else
+        struct winsize ws{};
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+            return static_cast<int>(ws.ws_row);
+        }
+#endif
+        return 24;
+    }
+
+    // Display cell width of one UTF-8 code point (cursor math only — mdtty
+    // does the actual formatting; this just counts rows to erase).
+    static int cell_width(uint32_t cp) {
+        if (cp < 0x80u) return 1;
+        if (cp == 0u) return 0;
+        if ((cp >= 0x0300u && cp <= 0x036Fu) || (cp >= 0x1AB0u && cp <= 0x1AFFu) ||
+            (cp >= 0x1DC0u && cp <= 0x1DFFu) || (cp >= 0x20D0u && cp <= 0x20FFu) ||
+            (cp >= 0xFE20u && cp <= 0xFE2Fu)) return 0;           // combining
+        if ((cp >= 0x1100u && cp <= 0x115Fu) || (cp >= 0x2E80u && cp <= 0xA4CFu) ||
+            (cp >= 0xAC00u && cp <= 0xD7A3u) || (cp >= 0xF900u && cp <= 0xFAFFu) ||
+            (cp >= 0xFE30u && cp <= 0xFE4Fu) || (cp >= 0xFF00u && cp <= 0xFF60u) ||
+            (cp >= 0xFFE0u && cp <= 0xFFE6u) || (cp >= 0x1F300u && cp <= 0x1FAFFu) ||
+            (cp >= 0x20000u && cp <= 0x3FFFDu)) return 2;          // CJK / emoji
+        return 1;
+    }
+
+    // Number of terminal rows the rendered string occupies (ANSI stripped).
+    static int count_rows(const std::string & rendered) {
+        const int cols = terminal_cols();
+        int rows = 0;
+        int width = 0;
+        size_t i = 0;
+        while (i < rendered.size()) {
+            if (rendered[i] == '\033' && i + 1 < rendered.size() && rendered[i + 1] == '[') {
+                i += 2;
+                while (i < rendered.size() && !(rendered[i] >= '@' && rendered[i] <= '~')) ++i;
+                if (i < rendered.size()) ++i;
                 continue;
             }
-            put(c);
+            const auto byte = [&](size_t k) {
+                return static_cast<unsigned char>(rendered[k]);
+            };
+            const unsigned char c = byte(i);
+            if (c == '\n') { rows += 1; width = 0; ++i; continue; }
+            uint32_t cp = c;
+            size_t n = 1;
+            if ((c & 0xE0u) == 0xC0u && i + 1 < rendered.size()) {
+                cp = static_cast<uint32_t>((c & 0x1Fu) << 6) |
+                     static_cast<uint32_t>(byte(i + 1) & 0x3Fu);
+                n = 2;
+            } else if ((c & 0xF0u) == 0xE0u && i + 2 < rendered.size()) {
+                cp = static_cast<uint32_t>((c & 0x0Fu) << 12) |
+                     static_cast<uint32_t>((byte(i + 1) & 0x3Fu) << 6) |
+                     static_cast<uint32_t>(byte(i + 2) & 0x3Fu);
+                n = 3;
+            } else if ((c & 0xF8u) == 0xF0u && i + 3 < rendered.size()) {
+                cp = static_cast<uint32_t>((c & 0x07u) << 18) |
+                     static_cast<uint32_t>((byte(i + 1) & 0x3Fu) << 12) |
+                     static_cast<uint32_t>((byte(i + 2) & 0x3Fu) << 6) |
+                     static_cast<uint32_t>(byte(i + 3) & 0x3Fu);
+                n = 4;
+            }
+            width += cell_width(cp);
+            if (width >= cols) { rows += width / cols; width %= cols; }
+            i += n;
+        }
+        return rows;
+    }
+
+    void draw() {
+        // Hold back a trailing incomplete thinking tag so "<thin" etc. never
+        // flash as response text; the suffix stays in `raw` for the next draw.
+        const size_t hold = partial_suffix(raw);
+        const std::string view = raw.substr(0, raw.size() - hold);
+        const std::string rendered = render_all(view);
+        const int old_rows = count_rows(last_render);
+        if (old_rows >= terminal_rows() - SCREEN_MARGIN) {
+            live = false;                    // too tall to redraw in place
+            pending = raw.substr(rendered_up_to);   // only the unseen tail
+            return;
+        }
+        if (live && !first && old_rows > 0) {
+            printf("\033[%dA", old_rows);    // up to the response start
+            printf("\033[J");                // erase everything below it
+        }
+        fputs(rendered.c_str(), stdout);
+        fflush(stdout);
+        last_render = rendered;
+        first = false;
+        rendered_up_to = view.size();
+    }
+
+    // Streaming path: mdtty line-buffers per line, emitting clean formatted
+    // text as lines complete. Handles thinking-tag routing + holdback.
+    void drain_s(bool force = false) {
+        while (!pending.empty()) {
+            size_t tag_i = std::string::npos;
+            size_t tag_len = 0;
+            bool   closing = false;
+            for (size_t i = 0; i < pending.size(); ++i) {
+                size_t len = 0;
+                if (tag_at(pending, i, true, len)) {
+                    tag_i = i; tag_len = len; closing = true;
+                    break;
+                }
+                if (!in_think_s && tag_at(pending, i, false, len)) {
+                    tag_i = i; tag_len = len;
+                    break;
+                }
+            }
+            if (tag_i != std::string::npos) {
+                if (tag_i > 0) (in_think_s ? think_s : resp_s).feed(pending.substr(0, tag_i));
+                (in_think_s ? think_s : resp_s).flush();
+                if (closing) {
+                    if (in_think_s) {
+                        printf(color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n");
+                        in_think_s = false;
+                    }
+                } else if (!in_think_s) {
+                    printf(color ? "\033[2;90m┌─ Thinking ─\033[0m\n" : "┌─ Thinking ─\n");
+                    in_think_s = true;
+                }
+                pending.erase(0, tag_i + tag_len);
+                continue;
+            }
+            const size_t hold = force ? 0 : partial_suffix(pending);
+            const size_t emit = pending.size() - hold;
+            if (emit == 0) break;            // only a partial tag pending
+            (in_think_s ? think_s : resp_s).feed(pending.substr(0, emit));
+            pending.erase(0, emit);
         }
     }
 
-    void feed(const std::string & s) { buf += s; drain(); }
-
-    void drain(bool force = false) {
-        while (!buf.empty()) {
-            const size_t hold = force ? 0 : partial_suffix(buf);
-            if (hold == buf.size()) break;
-            const std::string text = buf.substr(0, buf.size() - hold);
-            buf.erase(0, text.size());
-            render(text);
+    void feed(const std::string & s) {
+        if (!color || !live) {               // piped, or tall-response fallback
+            pending += s;
+            drain_s(false);
+            return;
+        }
+        raw += s;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_draw >= DRAW_MS) {
+            last_draw = now;
+            draw();
         }
     }
 
     void flush() {
-        drain(true);
-        if (in_think) printf("\033[2;90m└─ /Thinking ─\033[0m\n");
-        if (in_fence || in_code || in_heading || in_quote || bold || italic || strike) {
-            printf("\033[0m");
+        if (color && live) {
+            draw();                          // final live frame (full raw)
+        } else {
+            drain_s(true);
+            (in_think_s ? think_s : resp_s).flush();
+            if (in_think_s) {
+                printf(color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n");
+                in_think_s = false;
+            }
         }
-        in_think = in_fence = in_code = in_heading = in_quote = bold = italic = strike = false;
-        at_line_start = true;
-        buf.clear();
+        resp_s.reset();                      // ready for the next response
+        think_s.reset();
+        raw.clear();
+        pending.clear();
+        last_render.clear();
+        rendered_up_to = 0;
+        first = true;
+        live = true;
     }
 };
 
