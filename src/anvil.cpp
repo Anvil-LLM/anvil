@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.7";
+inline const char * ANVIL_VERSION = "0.4.8";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -2634,7 +2634,8 @@ AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
 // ──── src/chat.hpp ────
 
 
-int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw);
+int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
+             std::vector<ModelEntry> & models);
 // ──── src/chat.cpp ────
 
 
@@ -2754,7 +2755,8 @@ static std::vector<llama_token> tokenize_render(
 
 // ─── Chat REPL ─────────────────────────────────────────────────────────────
 
-int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
+int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
+             std::vector<ModelEntry> & models) {
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = cfg.ngl;
     mparams.use_mmap = true;
@@ -3054,6 +3056,23 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
         return true;
     };
 
+    // In-chat setting changes persist straight into the running model's
+    // profile (~/.anvil/models.json), so they survive across sessions.
+    // Only fires for a registered model (cli.friendly is always set by the
+    // run dispatcher — registry name or derived slug for path-runs).
+    auto persist_chat_setting = [&](const std::string & key, const nlohmann::json & value) {
+        if (cli.friendly.empty()) return;
+        if (ModelEntry * e = find_model(models, cli.friendly)) {
+            e->profile.set(key, value);
+            if (save_models(models)) {
+                printf("  └─ saved to profile '%s' (%s)\n", cli.friendly.c_str(), key.c_str());
+            } else {
+                printf("  └─ \033[33mwarning: could not save to profile '%s'\033[0m\n",
+                       cli.friendly.c_str());
+            }
+        }
+    };
+
     if (cli.prompt.empty()) {
         // ─── Interactive REPL ──────────────────────────────────────────────
         while (true) {
@@ -3150,7 +3169,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
                 }
                 cfg.temp = new_temp;
                 smpl.reset(build_sampler_chain(vocab, cfg, grammar_active, grammar_src));
-                printf("Temperature set to %.2f\n\n", new_temp);
+                printf("Temperature set to %.2f\n", new_temp);
+                // Store rounded to 2 decimals in double precision so the
+                // float32 value doesn't leak as 0.8999999761581421 in JSON.
+                persist_chat_setting("temp", std::round(static_cast<double>(new_temp) * 100.0) / 100.0);
+                printf("\n");
                 continue;
             }
 
@@ -3179,7 +3202,9 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw) {
                     printf("Context left unchanged.\n\n");
                     continue;
                 }
-                printf("Context resized to %d tokens; conversation reloaded.\n\n", new_ctx);
+                printf("Context resized to %d tokens; conversation reloaded.\n", new_ctx);
+                persist_chat_setting("n_ctx", new_ctx);
+                printf("\n");
                 continue;
             }
 
@@ -3442,6 +3467,6 @@ int main(int argc, char ** argv) {
     }
     write_config(cfg);
 
-    const int rc = run_chat(cli, cfg, hw);
+    const int rc = run_chat(cli, cfg, hw, models);
     return rc;
 }
