@@ -1,19 +1,4 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-#  installer-smoke.sh — fake-Linux harness for anvil's NVIDIA installer
-#
-#  Tests docs/anvil-nvidia-install.sh (universal installer) and
-#  docs/install.sh (CUDA-asset hook) WITHOUT real hardware, by pointing the
-#  scripts at a fake /etc/os-release, /proc/modules, and a PATH full of stub
-#  binaries (lspci, curl, uname, nvidia-smi, mokutil).
-#
-#  Deterministic by design: the fake curl serves a fixed NVIDIA version index,
-#  so branch-resolution assertions never drift as NVIDIA releases drivers.
-#
-#  Usage:
-#    bash tests/installer-smoke.sh          # run all groups
-#    bash tests/installer-smoke.sh GROUP    # run one group (see run_all)
-# ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
@@ -23,7 +8,7 @@ INSTALL_SH="${REPO_ROOT}/docs/install.sh"
 PASS=0
 FAIL=0
 
-report() { # pass|fail desc
+report() {
     if [ "$1" = pass ]; then
         echo "  [PASS] $2"; PASS=$((PASS + 1))
     else
@@ -31,9 +16,8 @@ report() { # pass|fail desc
     fi
 }
 
-# ─── Fake Linux environment ────────────────────────────────────────────────
 ROOT=""
-fake_env() { # gpu_line
+fake_env() {
     ROOT=$(mktemp -d)
     mkdir -p "${ROOT}/bin"
 
@@ -44,9 +28,8 @@ PRETTY_NAME="Ubuntu 24.04 LTS"
 EOF
     printf 'nouveau 12345 0 - Live 0xffffffff\n' > "${ROOT}/modules"
 
-    # Stub uname: install.sh and the installer both probe -s/-m/-r.
     cat > "${ROOT}/bin/uname" <<'EOF'
-#!/bin/sh
+
 case "$1" in
     -s) echo Linux ;;
     -m) echo x86_64 ;;
@@ -56,7 +39,7 @@ esac
 EOF
 
     cat > "${ROOT}/bin/curl" <<'EOF'
-#!/bin/sh
+
 out=""; url=""; prev=""
 for a in "$@"; do
     [ "$a" = "-o" ] && out=""
@@ -64,10 +47,7 @@ for a in "$@"; do
     prev=$a; url=$a
 done
 if [ -n "$out" ]; then
-    # A runnable dummy anvil: install.sh executes it via "$TMP_BIN" --version.
-    # Deliberately NO chmod: real curl/wget never preserve exec bits, and
-    # install.sh must chmod +x itself — this is what caught the "does not run
-    # on this system" bug that a chmod'd stub would have masked.
+
     printf '#!/bin/sh\ncase "$1" in --version) echo "anvil v9.9.9 (fake)"; exit 0 ;; *) exit 0 ;; esac\n' > "$out"
     exit 0
 fi
@@ -82,17 +62,14 @@ EOF
     chmod +x "${ROOT}/bin/"*
 }
 
-# Generate the installer with fake paths baked in, then run it with the fake
-# PATH. (No xargs: BSD xargs mangles long -I{} command lines.)
 fake_installer() {
     sed -e "s|/etc/os-release|${ROOT}/os-release|" -e "s|/proc/modules|${ROOT}/modules|" "$INSTALLER" > "${ROOT}/installer.sh"
     chmod +x "${ROOT}/installer.sh"
 }
-run_nv() { # args...
+run_nv() {
     PATH="${ROOT}/bin:$PATH" sh "${ROOT}/installer.sh" "$@" 2>&1
 }
 
-# ─── Group 1: branch selection per GPU generation ───────────────────────────
 test_branches() {
     echo "── Group: branch selection (universal mode, --dry-run)"
 
@@ -128,7 +105,6 @@ test_branches() {
     echo "$OUT" | grep -q '580.178.04' && report pass "--driver pinning overrides branch" || report fail "--driver pinning"
 }
 
-# ─── Group 2: modes, flags, guards ──────────────────────────────────────────
 test_modes() {
     echo "── Group: modes, flags, guards"
 
@@ -144,7 +120,6 @@ test_modes() {
     echo "$OUT" | grep -q 'Mode        : distro' && report pass "--distro mode selected" || report fail "--distro mode"
     echo "$OUT" | grep -q 'apt-get install' && report pass "--distro prints apt commands" || report fail "--distro apt commands"
 
-    # Non-interactive without --yes must refuse.
     fake_env 'VGA compatible controller: NVIDIA Corporation GP104 [GeForce GTX 1080]'
     fake_installer
     ERR=$(run_nv </dev/null; echo "exit=$?")
@@ -156,13 +131,10 @@ test_modes() {
     echo "$OUT" | grep -qi 'universal NVIDIA driver installer' && report pass "--help renders" || report fail "--help"
 }
 
-# ─── Group 3: install.sh CUDA-asset hook ────────────────────────────────────
 test_install_sh() {
     echo "── Group: install.sh NVIDIA hook"
 
-    # Runs install.sh against the CURRENT fake env (call fake_env first, then
-    # optionally override bin/ stubs, then run_inst).
-    run_inst() { # extra-args...
+    run_inst() {
         mkdir -p "${ROOT}/home"
         PATH="${ROOT}/bin:$PATH" HOME="${ROOT}/home" INSTALL_DIR="${ROOT}/tgt" ANVIL_VERSION=v9.9.9 ANVIL_SKIP_CHECKSUM=1 \
             sh "$INSTALL_SH" "$@" 2>&1
@@ -177,10 +149,9 @@ test_install_sh() {
     OUT=$(run_inst)
     echo "$OUT" | grep -q 'curl -fsSL -O' && report pass "offer uses download-then-sudo (no auto-sudo)" || report fail "offer safety"
 
-    # CUDA download failure -> fallback to plain asset.
     fake_env 'VGA compatible controller: NVIDIA Corporation AD102 [GeForce RTX 4090]'
     cat > "${ROOT}/bin/curl" <<'EOF'
-#!/bin/sh
+
 out=""; url=""; prev=""
 for a in "$@"; do
     [ "$a" = "-o" ] && out=""
@@ -189,7 +160,7 @@ for a in "$@"; do
 done
 if [ -n "$out" ]; then
     printf '%s' "$url" | grep -q -- '-cuda' && exit 1
-    # No chmod, matching real curl — install.sh must chmod +x before probing.
+
     printf '#!/bin/sh\ncase "$1" in --version) echo "anvil v9.9.9 (fake)"; exit 0 ;; *) exit 0 ;; esac\n' > "$out"
     exit 0
 fi
@@ -199,25 +170,21 @@ EOF
     OUT=$(run_inst)
     echo "$OUT" | grep -q 'trying fallback' && report pass "CUDA download fail -> falls back to plain asset" || report fail "CUDA fallback"
 
-    # Driver present -> no offer.
     fake_env 'VGA compatible controller: NVIDIA Corporation AD102 [GeForce RTX 4090]'
     printf '#!/bin/sh\necho 595.84\n' > "${ROOT}/bin/nvidia-smi"
     chmod +x "${ROOT}/bin/nvidia-smi"
     OUT=$(run_inst)
     echo "$OUT" | grep -q 'driver is not installed' && report fail "offer shown despite driver present" || report pass "driver present -> no offer"
 
-    # --nvidia forces CUDA on a non-NVIDIA box.
     fake_env 'VGA compatible controller: Advanced Micro Devices [AMD/ATI] Navi 21 [Radeon RX 6800 XT]'
     OUT=$(run_inst --nvidia)
     echo "$OUT" | grep -q 'forcing the CUDA build' && report pass "--nvidia forces CUDA asset" || report fail "--nvidia force"
 
-    # No GPU, no flag -> plain asset.
     fake_env 'VGA compatible controller: Advanced Micro Devices [AMD/ATI] Navi 21 [Radeon RX 6800 XT]'
     OUT=$(run_inst)
     echo "$OUT" | grep -q -- '--cuda' && report fail "CUDA asset used without --nvidia on AMD" || report pass "no GPU/no flag -> plain asset"
 }
 
-# ─── Main ───────────────────────────────────────────────────────────────────
 run_all() {
     echo "== anvil installer smoke test =="
     echo "== installer: ${INSTALLER}"

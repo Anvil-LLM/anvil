@@ -14,6 +14,12 @@
 #include <utility>
 
 #if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  include <io.h>
 #  include <windows.h>
 #else
@@ -26,26 +32,25 @@ namespace mdtty {
 namespace {
 
 constexpr std::string_view k_fence        = "```";
-constexpr std::string_view k_hr_char      = "\xe2\x94\x80"; // U+2500 ─
-constexpr std::string_view k_quote_gutter = "\xe2\x94\x82 "; // U+2502 "│ "
+constexpr std::string_view k_hr_char      = "\xe2\x94\x80";
+constexpr std::string_view k_quote_gutter = "\xe2\x94\x82 ";
 
-// Table box-drawing characters.
-constexpr std::string_view k_tbl_h  = "\xe2\x94\x80"; // ─
-constexpr std::string_view k_tbl_v  = "\xe2\x94\x82"; // │
-constexpr std::string_view k_tbl_tl = "\xe2\x94\x8c"; // ┌
-constexpr std::string_view k_tbl_tr = "\xe2\x94\x90"; // ┐
-constexpr std::string_view k_tbl_bl = "\xe2\x94\x94"; // └
-constexpr std::string_view k_tbl_br = "\xe2\x94\x98"; // ┘
-constexpr std::string_view k_tbl_td = "\xe2\x94\xac"; // ┬
-constexpr std::string_view k_tbl_tu = "\xe2\x94\xb4"; // ┴
-constexpr std::string_view k_tbl_lj = "\xe2\x94\x9c"; // ├
-constexpr std::string_view k_tbl_rj = "\xe2\x94\xa4"; // ┤
-constexpr std::string_view k_tbl_cr = "\xe2\x94\xbc"; // ┼
+constexpr std::string_view k_tbl_h  = "\xe2\x94\x80";
+constexpr std::string_view k_tbl_v  = "\xe2\x94\x82";
+constexpr std::string_view k_tbl_tl = "\xe2\x94\x8c";
+constexpr std::string_view k_tbl_tr = "\xe2\x94\x90";
+constexpr std::string_view k_tbl_bl = "\xe2\x94\x94";
+constexpr std::string_view k_tbl_br = "\xe2\x94\x98";
+constexpr std::string_view k_tbl_td = "\xe2\x94\xac";
+constexpr std::string_view k_tbl_tu = "\xe2\x94\xb4";
+constexpr std::string_view k_tbl_lj = "\xe2\x94\x9c";
+constexpr std::string_view k_tbl_rj = "\xe2\x94\xa4";
+constexpr std::string_view k_tbl_cr = "\xe2\x94\xbc";
 
 constexpr std::array<std::string_view, 3> k_bullets = {
-    "\xe2\x80\xa2", // • U+2022
-    "\xe2\x97\xa6", // ◦ U+25E6
-    "\xe2\x96\xb8", // ▸ U+25B8
+    "\xe2\x80\xa2",
+    "\xe2\x97\xa6",
+    "\xe2\x96\xb8",
 };
 
 std::size_t count_leading_spaces(std::string_view line) {
@@ -63,7 +68,6 @@ std::string_view trim_right(std::string_view s) {
   return s;
 }
 
-/// 3+ uniform - = or * characters (ignoring spaces).
 bool is_hr_line(std::string_view line) {
   line = trim_right(line);
   auto content = line;
@@ -122,7 +126,6 @@ int detect_terminal_width() {
   return 80;
 }
 
-/// Returns true if the line looks like a table row (starts with '|').
 bool is_table_line(std::string_view line) {
   while (!line.empty() && line.front() == ' ') {
     line.remove_prefix(1);
@@ -140,7 +143,6 @@ std::string_view trim_cell(std::string_view cell) {
   return cell;
 }
 
-/// Splits a table row on '|', stripping the leading/trailing pipes.
 std::vector<std::string_view> split_table_row(std::string_view line) {
   line = trim_right(line);
   if (!line.empty() && line.front() == '|') {
@@ -161,7 +163,6 @@ std::vector<std::string_view> split_table_row(std::string_view line) {
   return cells;
 }
 
-/// Returns true if the cell content is a valid separator (e.g. "---", ":---:", ":---").
 bool is_separator_cell(std::string_view cell) {
   if (cell.empty()) {
     return false;
@@ -178,18 +179,8 @@ bool is_separator_cell(std::string_view cell) {
   return std::ranges::all_of(cell, [](char c) { return c == '-'; });
 }
 
-/// Returns the column width of \p cp, overriding utf8proc for emoji codepoints
-/// that modern terminals render at width 2 even though their formal Unicode
-/// East_Asian_Width is Neutral. Source: emoji-data.txt's Emoji_Presentation=Yes
-/// property, grouped into broad ranges. Keep this list in sync with promptty.
-/// True if \p cp is an Emoji=Yes / Emoji_Presentation=No codepoint that
-/// terminals nevertheless render at width 2. Unicode classifies these as
-/// "default text presentation," but in practice modern terminals (kitty,
-/// wezterm, ghostty, foot, GNOME Terminal, iTerm2) ignore that and render
-/// them as emoji. This list is the canonical set; keep it in sync with
-/// promptty's copy.
 bool is_text_presentation_wide_emoji(uint32_t cp) {
-  // Sorted by codepoint for readability.
+
   switch (cp) {
   case 0x203C: case 0x2049: case 0x2122: case 0x2139:
   case 0x2194: case 0x2195: case 0x2196: case 0x2197: case 0x2198: case 0x2199:
@@ -228,34 +219,24 @@ bool is_text_presentation_wide_emoji(uint32_t cp) {
   }
 }
 
-/// Returns the column width of \p cp using the widecharwidth table, which is
-/// generated from the upstream Unicode data files (UnicodeData.txt,
-/// EastAsianWidth.txt, emoji-data.txt). This is the same source modern
-/// terminals (kitty, wezterm, ghostty, foot, GNOME Terminal, iTerm2) use.
 int terminal_charwidth(utf8proc_int32_t cp) {
   if (cp < 0)
     return 1;
-  // Default-text emoji that terminals render wide anyway. Checked first
-  // because widecharwidth would otherwise report these as width 1.
+
   if (is_text_presentation_wide_emoji(static_cast<uint32_t>(cp)))
     return 2;
   int w = widechar_wcwidth(static_cast<uint32_t>(cp));
   if (w == widechar_combining)
     return 0;
-  // widened_in_9: Unicode 9 promoted these to wide because of emoji
-  // presentation. Modern terminals render them at width 2.
+
   if (w == widechar_widened_in_9)
     return 2;
-  // Other negative codes (nonprint/ambiguous/private/unassigned) fall back
-  // to width 1: safe default for "printable but we don't know."
+
   if (w < 0)
     return 1;
   return w;
 }
 
-/// Adds the column width of one codepoint at \p text[i] to \p w, advancing \p i
-/// past the consumed bytes. Handles grapheme clusters via \p prev_cp / \p state
-/// so that combining marks and ZWJ sequences count as a single cluster.
 void add_codepoint_width(std::string_view text, std::size_t &i, std::size_t &w,
                           utf8proc_int32_t &prev_cp, utf8proc_int32_t &state) {
   utf8proc_int32_t cp = 0;
@@ -263,13 +244,13 @@ void add_codepoint_width(std::string_view text, std::size_t &i, std::size_t &w,
       reinterpret_cast<const utf8proc_uint8_t *>(text.data() + i),
       static_cast<utf8proc_ssize_t>(text.size() - i), &cp);
   if (consumed < 1) {
-    // Malformed byte: skip one and treat as width 1 to stay roughly aligned.
+
     ++w;
     ++i;
     return;
   }
   if (prev_cp != 0 && !utf8proc_grapheme_break_stateful(prev_cp, cp, &state)) {
-    // Continuation of the previous grapheme cluster — width 0.
+
   } else {
     int cw = terminal_charwidth(cp);
     if (cw > 0)
@@ -279,7 +260,6 @@ void add_codepoint_width(std::string_view text, std::size_t &i, std::size_t &w,
   i += static_cast<std::size_t>(consumed);
 }
 
-/// Computes the visual width of inline markdown text (strips formatting markers).
 std::size_t visual_width(std::string_view text) {
   std::size_t w = 0;
   std::size_t i = 0;
@@ -300,7 +280,7 @@ std::size_t visual_width(std::string_view text) {
       continue;
     }
     if (c == '\\' && i + 1 < text.size()) {
-      ++i; // skip the backslash
+      ++i;
       add_codepoint_width(text, i, w, prev_cp, state);
       continue;
     }
@@ -333,7 +313,7 @@ bool stdout_is_tty() {
 #endif
 }
 
-} // namespace
+}
 
 Renderer::Renderer(Sink sink, Config cfg) : sink_(std::move(sink)), cfg_(cfg) {
   if (!cfg_.strip_ansi && !stdout_is_tty()) {
@@ -395,17 +375,16 @@ void Renderer::reset() {
 }
 
 void Renderer::process_line(std::string_view line) {
-  // --- Table continuation ---
+
   if (!table_buf_.empty() && !in_fence_) {
     if (is_table_line(line)) {
       table_buf_.emplace_back(line);
       return;
     }
     flush_table();
-    // Fall through to process current line normally.
+
   }
 
-  // --- Fenced code block handling ---
   if (in_fence_) {
     if (is_fence_line(line)) {
       in_fence_         = false;
@@ -432,13 +411,11 @@ void Renderer::process_line(std::string_view line) {
     return;
   }
 
-  // --- Blank line ---
   if (trim_right(line).empty()) {
     emit_raw("\n");
     return;
   }
 
-  // --- Horizontal rule ---
   if (is_hr_line(line)) {
     const int w = terminal_width();
     emit_style(cfg_.hr);
@@ -453,7 +430,6 @@ void Renderer::process_line(std::string_view line) {
     return;
   }
 
-  // --- Heading ---
   if (line.starts_with('#')) {
     std::size_t level = 0;
     while (level < line.size() && level < 6 && line[level] == '#') {
@@ -471,7 +447,6 @@ void Renderer::process_line(std::string_view line) {
     }
   }
 
-  // --- Blockquote ---
   if (line.starts_with('>')) {
     auto body = line;
     body.remove_prefix(1);
@@ -486,7 +461,6 @@ void Renderer::process_line(std::string_view line) {
     return;
   }
 
-  // --- Unordered list ---
   {
     const std::size_t indent = count_leading_spaces(line);
     auto              rest   = line.substr(indent);
@@ -505,7 +479,6 @@ void Renderer::process_line(std::string_view line) {
     }
   }
 
-  // --- Ordered list ---
   {
     const std::size_t indent = count_leading_spaces(line);
     auto              rest   = line.substr(indent);
@@ -525,13 +498,11 @@ void Renderer::process_line(std::string_view line) {
     }
   }
 
-  // --- Table start ---
   if (is_table_line(line)) {
     table_buf_.emplace_back(line);
     return;
   }
 
-  // --- Paragraph ---
   emit_inline(line);
   emit_raw("\n");
 }
@@ -541,7 +512,6 @@ void Renderer::flush_table() {
     return;
   }
 
-  // Validate: second row must be a separator (e.g. |---|---|).
   bool valid = table_buf_.size() >= 2;
   if (valid) {
     auto sep_cells = split_table_row(table_buf_[1]);
@@ -550,7 +520,7 @@ void Renderer::flush_table() {
   }
 
   if (!valid) {
-    // Not a real table, emit buffered lines as paragraphs.
+
     for (auto &row : table_buf_) {
       emit_inline(row);
       emit_raw("\n");
@@ -559,7 +529,6 @@ void Renderer::flush_table() {
     return;
   }
 
-  // Parse rows into cells (skip the separator at index 1).
   std::vector<std::vector<std::string_view>> rows;
   std::size_t num_cols = 0;
   for (std::size_t i = 0; i < table_buf_.size(); ++i) {
@@ -571,7 +540,6 @@ void Renderer::flush_table() {
     rows.push_back(std::move(cells));
   }
 
-  // Compute column widths from visual (inline-stripped) content.
   std::vector<std::size_t> widths(num_cols, 0);
   for (auto &row : rows) {
     for (std::size_t c = 0; c < row.size(); ++c) {
@@ -582,7 +550,6 @@ void Renderer::flush_table() {
     w = std::max(w, std::size_t{1});
   }
 
-  // Helper: emit a horizontal border line.
   auto emit_border = [&](std::string_view left, std::string_view mid,
                          std::string_view right) {
     emit_style(cfg_.table);
@@ -597,7 +564,6 @@ void Renderer::flush_table() {
     emit_raw("\n");
   };
 
-  // Helper: emit a data row.
   auto emit_row = [&](std::vector<std::string_view> &row, const char *cell_style) {
     for (std::size_t c = 0; c < num_cols; ++c) {
       emit_style(cfg_.table);
@@ -624,21 +590,16 @@ void Renderer::flush_table() {
     emit_raw("\n");
   };
 
-  // Top border.
   emit_border(k_tbl_tl, k_tbl_td, k_tbl_tr);
 
-  // Header row.
   emit_row(rows[0], cfg_.table_head);
 
-  // Header/body separator.
   emit_border(k_tbl_lj, k_tbl_cr, k_tbl_rj);
 
-  // Body rows.
   for (std::size_t r = 1; r < rows.size(); ++r) {
     emit_row(rows[r], nullptr);
   }
 
-  // Bottom border.
   emit_border(k_tbl_bl, k_tbl_tu, k_tbl_br);
 
   table_buf_.clear();
@@ -692,7 +653,6 @@ void Renderer::emit_inline(std::string_view line) {
       continue;
     }
 
-    // Bold: ** or __ (checked before italic).
     if ((c == '*' || c == '_') && i + 1 < n && line[i + 1] == c) {
       if (span == Span::Bold) {
         close_span();
@@ -706,7 +666,6 @@ void Renderer::emit_inline(std::string_view line) {
       continue;
     }
 
-    // Italic: single * or _.
     if (c == '*' || c == '_') {
       if (span == Span::Italic) {
         close_span();
@@ -719,7 +678,6 @@ void Renderer::emit_inline(std::string_view line) {
       continue;
     }
 
-    // Inline code.
     if (c == '`') {
       if (span == Span::None) {
         open_span(Span::Code, cfg_.code_inline);
@@ -734,22 +692,14 @@ void Renderer::emit_inline(std::string_view line) {
     ++i;
   }
 
-  // Auto-close any open span at end-of-line so ANSI never leaks across lines.
   close_span();
 }
 
 std::string Renderer::render(std::string_view markdown, Config cfg) {
   std::string out;
-  // Force strip_ansi based on the caller's choice, not the TTY state of this
-  // process: the static helper returns a string, it does not write to stdout.
-  // The constructor's auto-detect would otherwise strip ANSI when stdout is
-  // not a TTY even though the caller asked for a styled string.
-  // `auto(...)` (decay-copy, C++23) replaced with an explicit std::function
-  // so the whole library builds as C++20 — the only C++23 construct.
+
   Renderer r(std::function<void(std::string_view)>([&out](std::string_view s) { out.append(s); }), cfg);
-  // Undo any auto strip_ansi the constructor applied; honor the caller's cfg.
-  // (Accomplished by directly re-feeding with a fresh renderer whose sink is
-  // purely in-memory — we just need to reset the config override.)
+
   r.cfg_.strip_ansi = cfg.strip_ansi;
   r.feed(markdown);
   r.flush();
@@ -760,4 +710,4 @@ bool Renderer::is_tty() {
   return stdout_is_tty();
 }
 
-} // namespace mdtty
+}

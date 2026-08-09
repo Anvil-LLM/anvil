@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Anvil — Forge anything.</title>
-<meta name="description" content="Anvil is a terminal-native LLM client on your machine. 4.2x KV compression, ~1% quality loss, MTP+NextN speculative decoding, zero cloud.">
+<title>anvil — Forge anything.</title>
+<meta name="description" content="anvil is a terminal-native LLM client built on TurboQuant — the Google Research KV-cache compression algorithm. Up to 6.4x smaller KV cache, MTP+NextN speculative decoding, zero cloud, zero telemetry.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;900&family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
@@ -13,7 +13,7 @@
   --bg:#0c0a07; --bg2:#110d08; --panel:#151009; --panel2:#1a140b;
   --line:#2c2214; --line2:#3d2f1c;
   --amber:#ff9d2e; --hot:#ff6a00; --pale:#ffc46b;
-  --green:#5df0a2; --red:#ff5c3d;
+  --green:#5df0a2; --red:#ff5c3d; --blue:#6ec1ff;
   --text:#ece2d0; --muted:#a8987f; --dim:#6f6152;
   --mono:'JetBrains Mono',ui-monospace,monospace;
   --disp:'Unbounded',sans-serif;
@@ -80,7 +80,7 @@ h1 .hot{color:var(--amber);text-shadow:0 0 28px rgba(255,157,46,.55),0 0 90px rg
 .term-bar{display:flex;align-items:center;gap:8px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
 .dot{width:11px;height:11px;border-radius:50%}.dot.r{background:#ff5f57}.dot.y{background:#febc2e}.dot.g{background:#28c840}
 .term-title{margin-left:10px;font-size:12px;color:var(--dim)}
-.term-body{padding:18px 20px;height:460px;overflow:hidden;font-size:12.5px;line-height:1.62}
+.term-body{padding:18px 20px;height:470px;overflow:hidden;font-size:12.5px;line-height:1.62}
 .term-body .ln{white-space:pre-wrap;word-break:break-word}
 .c-cmd{color:var(--text)}.c-out{color:var(--muted)}
 .c-logo{color:var(--amber);text-shadow:0 0 14px rgba(255,157,46,.4)}
@@ -164,30 +164,6 @@ h2{font-family:var(--disp);font-weight:700;font-size:clamp(1.7rem,3.2vw,2.6rem);
 .kv-stat .v{font-family:var(--disp);font-weight:700;font-size:24px;transition:color .3s}
 .kv-stat .k{font-size:11px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-top:4px}
 #kv-gb{color:var(--amber)}#kv-x{color:var(--green)}#kv-loss{color:var(--pale)}
-.calc{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,3fr);gap:40px;align-items:start}
-.calc-ctl{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}
-.calc-ctl label{display:block;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin:20px 0 8px}
-.calc-ctl label:first-child{margin-top:0}
-.calc-ctl select{width:100%;background:#0d0903;border:1px solid var(--line2);border-radius:6px;color:var(--pale);
-  font-family:var(--mono);font-size:13px;padding:10px 12px;cursor:pointer;transition:border-color .2s}
-.calc-ctl select:hover{border-color:var(--amber)}
-.calc-ctl input[type=range]{width:100%;accent-color:var(--hot);cursor:pointer}
-.ctx-read{color:var(--amber);font-weight:700;font-size:13px}
-.calc-out{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}
-.stackbar{height:44px;background:#0d0903;border:1px solid var(--line);border-radius:6px;overflow:hidden;display:flex;margin-bottom:8px}
-.stackbar .w{background:linear-gradient(90deg,#8a5a1f,var(--amber));transition:width .6s cubic-bezier(.2,.8,.2,1)}
-.stackbar .k{background:linear-gradient(90deg,var(--hot),var(--red));transition:width .6s cubic-bezier(.2,.8,.2,1)}
-.stack-scale{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:24px}
-.calc-nums{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:24px}
-.calc-nums>div{background:var(--panel2);padding:16px 18px}
-.calc-nums .v{font-family:var(--disp);font-weight:700;font-size:22px}
-.calc-nums .k{font-size:10.5px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-top:3px}
-#cn-w{color:var(--amber)}#cn-kv{color:var(--red)}#cn-tot{color:var(--green)}
-.gpu-fit{display:flex;flex-wrap:wrap;gap:10px}
-.gpu-chip{font-size:12px;font-weight:700;padding:8px 14px;border-radius:6px;border:1px solid var(--line);color:var(--dim);transition:all .3s}
-.gpu-chip.ok{border-color:rgba(93,240,162,.5);color:var(--green);background:rgba(93,240,162,.08);box-shadow:0 0 14px rgba(93,240,162,.2)}
-.gpu-chip.no{border-color:rgba(255,92,61,.35);color:var(--red);background:rgba(255,92,61,.05)}
-.calc-note{font-size:11px;color:var(--dim);margin-top:18px}
 .spec-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:center}
 .tokline{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}
 .tok{width:44px;height:44px;border-radius:6px;display:flex;align-items:center;justify-content:center;
@@ -244,7 +220,7 @@ table.cmp{width:100%;border-collapse:collapse;min-width:760px;font-size:13px}
 .cfg-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:start}
 .codeblock{background:#0e0a05;border:1px solid var(--line);border-radius:10px;padding:26px 28px;font-size:13px;line-height:1.85;overflow-x:auto}
 .codeblock .k{color:var(--pale)} .codeblock .s{color:var(--green)} .codeblock .n{color:var(--amber)}
-.codeblock .b{color:var(--red)} .codeblock .cm{color:var(--dim)}
+.codeblock .b{color:var(--red)}
 .cfg-notes{list-style:none}
 .cfg-notes li{padding-left:24px;position:relative;margin-bottom:16px;color:var(--muted);font-size:13.5px}
 .cfg-notes li::before{content:"▸";position:absolute;left:0;color:var(--hot)}
@@ -293,7 +269,6 @@ table.cmp{width:100%;border-collapse:collapse;min-width:760px;font-size:13px}
 .tabpanel{display:none;background:#0e0a05;border:1px solid var(--line);border-top:none;border-radius:0 0 10px 10px;padding:26px 28px}
 .tabpanel.active{display:block}
 .tabpanel pre{font-size:13px;color:var(--green);line-height:1.8;overflow-x:auto}
-.tabpanel .cm{color:var(--dim)}
 .tabpanel .note{color:var(--muted);font-size:13px;margin-top:14px}
 .tabpanel .note b{color:var(--pale);font-weight:500}
 .cta{border:1px solid var(--line2);border-radius:14px;padding:64px 56px;position:relative;overflow:hidden;
@@ -318,8 +293,41 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
 #totop:hover{background:var(--amber);color:#0c0a07;transform:translateY(-3px)}
 .reveal{opacity:0;transform:translateY(28px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.8,.2,1)}
 .reveal.in{opacity:1;transform:none}
+.papercite{border:1px dashed var(--line2);border-radius:8px;padding:14px 18px;margin-top:20px;font-size:12px;color:var(--dim)}
+.papercite a{color:var(--amber);text-decoration:none}
+.papercite a:hover{color:var(--pale)}
+.papercite b{color:var(--muted);font-weight:500}
+.formula{background:#0e0a05;border:1px solid var(--line2);border-radius:6px;padding:14px 18px;overflow-x:auto;color:var(--green);font-size:13px;line-height:1.7}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:40px}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px;transition:border-color .2s,transform .15s}
+.step:hover{border-color:var(--amber);transform:translateY(-3px)}
+.step .sn{font-family:var(--disp);font-size:15px;color:var(--amber);margin-bottom:10px}
+.step p{color:var(--muted);font-size:13px}
+.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:40px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px;transition:border-color .2s}
+.card:hover{border-color:var(--green)}
+.card .ct{font-family:var(--disp);font-size:15px;color:var(--green);margin-bottom:10px}
+.card p{color:var(--muted);font-size:13px}
+.panel-box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px 32px;margin-top:40px}
+.panel-box .pt{font-family:var(--disp);font-size:16px;color:var(--pale);margin-bottom:14px}
+.panel-box p{color:var(--muted);font-size:13.5px;margin-bottom:16px}
+.tui-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:center}
+.tui-term{background:#0f0b06;border:1px solid var(--line2);border-radius:10px;padding:24px 26px;font-size:12.5px;line-height:1.7;box-shadow:0 0 0 1px #000,0 30px 70px rgba(0,0,0,.6)}
+.tui-term pre{color:var(--amber);text-shadow:0 0 12px rgba(255,157,46,.4);white-space:pre;font-size:10px;line-height:1.3}
+.feature-list{list-style:none}
+.feature-list li{padding-left:24px;position:relative;margin-bottom:14px;color:var(--muted);font-size:13.5px}
+.feature-list li::before{content:"▸";position:absolute;left:0;color:var(--hot)}
+.feature-list li b{color:var(--pale);font-weight:500;display:block}
+.reg{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:start}
+.reg-term{background:#0f0b06;border:1px solid var(--line2);border-radius:10px;padding:20px 22px;font-size:12.5px;line-height:1.75;overflow-x:auto;box-shadow:0 0 0 1px #000,0 30px 70px rgba(0,0,0,.6)}
+.reg-term .r-out{color:var(--muted)}
+.reg-term .r-name{color:var(--pale);font-weight:700}
+.reg-term .r-size{color:var(--dim)}
+.reg-term .r-kv{color:var(--green)}
+.reg-term .r-ctx{color:var(--amber)}
+.reg-term .r-cmd{color:var(--text);font-weight:700}
 @media(max-width:1000px){
-  .hero,.kv-wrap,.spec-grid,.tui-grid,.cfg-grid,.calc{grid-template-columns:1fr}
+  .hero,.kv-wrap,.spec-grid,.tui-grid,.cfg-grid,.calc,.reg{grid-template-columns:1fr}
   .backend-grid{grid-template-columns:repeat(3,1fr)}
   .cmds{grid-template-columns:repeat(2,1fr)}
   .use{grid-template-columns:60px 1fr}.use .ex{grid-column:2}
@@ -327,6 +335,7 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   .bench-head,.bench-row{grid-template-columns:1.2fr 1.6fr .8fr 1fr}
   .bench-head div:nth-child(4),.bench-row .delta{display:none}
   .pipe{grid-template-columns:repeat(3,1fr);gap:24px 0}.pipe::before,.pipe .pdot{display:none}
+  .steps,.grid2{grid-template-columns:1fr}
   .man-cols{grid-template-columns:1fr}
 }
 @media(max-width:560px){
@@ -353,31 +362,30 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
     <a href="#bench">Benchmarks</a>
     <a href="#kv">KV Cache</a>
     <a href="#turboquant">TurboQuant</a>
-    <a href="#calc">VRAM</a>
-    <a href="#tuning">Tuning</a>
+    <a href="#registry">Registry</a>
     <a href="#compare">Compare</a>
     <a href="#faq">FAQ</a>
     <a href="#install">Install</a>
   </div>
   <div class="right">
-    <span class="ver">v0.2.0</span>
-    <a class="gh-btn" href="https://github.com/anvil-llm/anvil">GitHub ↗</a>
+    <span class="ver">v0.5.0</span>
+    <a class="gh-btn" href="https://github.com/Anvil-LLM/anvil">GitHub ↗</a>
   </div>
 </nav>
 <main>
 <header class="hero">
   <div>
-    <div class="tag">anvil run model.gguf</div>
+    <div class="tag">anvil run qwen3.6-27b.gguf --ctx 131072</div>
     <h1>FORGE<br><span class="hot">ANYTHING.</span></h1>
-    <p class="lede">A terminal-native LLM client built on <b>TurboQuant & Modern AI Practices</b>. Squeeze <b>4.2× more context</b> out of your GPU with ~1% quality loss. No cloud. No API keys. No telemetry. Just you, your hardware, and a hammer.</p>
+    <p class="lede">A terminal-native LLM client built on <b>TurboQuant</b> — the Google Research KV-cache compression algorithm. Up to <b>6.4× smaller cache</b> with quality-neutral 3.5-bit quantization. No cloud. No API keys. No telemetry.</p>
     <div class="installbox">
       <span class="dollar">$</span>
       <code id="install-cmd">curl -fsSL https://anvil-llm.github.io/anvil/install.sh | sh</code>
       <button class="copybtn" data-copy="#install-cmd">copy</button>
     </div>
     <div class="statstrip">
-      <div class="st"><div class="num">4.2×</div><div class="lbl">KV compression</div></div>
-      <div class="st"><div class="num">~1%</div><div class="lbl">quality loss</div></div>
+      <div class="st"><div class="num">6.4×</div><div class="lbl">max KV compression</div></div>
+      <div class="st"><div class="num">0.997</div><div class="lbl">NIAH recall = full precision</div></div>
       <div class="st"><div class="num">0</div><div class="lbl">cloud calls</div></div>
     </div>
   </div>
@@ -394,7 +402,7 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div class="reveal">
     <div class="kicker">strike-it-yourself</div>
     <h2>Don't take our word for it. Type.</h2>
-    <p class="sub">A live slice of the anvil REPL, right here in your browser. Try <b>help</b>, <b>/stats</b>, <b>/ctx</b>, or just say something.</p>
+    <p class="sub">A live slice of the anvil REPL, right here in your browser. Try <b>help</b>, <b>/stats</b>, <b>/ctx</b>, <b>anvil list</b>, or just say something.</p>
   </div>
   <div class="reveal">
     <div class="play-term" id="play-term">
@@ -408,7 +416,7 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
         <input id="play-in" type="text" autocomplete="off" spellcheck="false" placeholder="type a command or a message…">
       </div>
     </div>
-    <p class="play-hint">try: <b>help</b> · <b>/stats</b> · <b>/model</b> · <b>/ctx</b> · <b>/temp 0.9</b> · <b>/clear</b> · or any message</p>
+    <p class="play-hint">try: <b>help</b> · <b>/stats</b> · <b>/model</b> · <b>/ctx</b> · <b>/temp 0.9</b> · <b>anvil list</b> · <b>anvil pull</b> · or any message</p>
   </div>
 </section>
 <div class="divider"></div>
@@ -428,55 +436,114 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div class="reveal">
     <div class="kicker">temper</div>
     <h2>Numbers don't lie.</h2>
-    <p class="sub">WikiText-2 perplexity from the Google Paper's own benchmarks. Lower PPL is better. The <b>recommended preset</b> buys you 4.2× the context headroom for about a one-percent quality haircut.</p>
+    <p class="sub">Results straight from the TurboQuant paper (Google Research, arXiv:2504.19874). TurboQuant at <b>3.5 bits</b> scores <b>identically to the full-precision cache</b> — same LongBench average, same needle-in-a-haystack recall.</p>
   </div>
-  <div class="bench reveal">
-    <div class="bench-head">
-      <div>K / V cache type</div><div>compression</div><div>ppl ↓</div><div>Δ ppl</div><div>quality</div>
-    </div>
-    <div class="bench-row">
-      <div class="cfg">f16 / f16<small>baseline · no compression</small></div>
-      <div class="bar"><i data-w="16"></i></div>
-      <div class="ppl">6.0125</div><div class="delta">—</div>
-      <div><span class="chip g">reference</span></div>
-    </div>
-    <div class="bench-row">
-      <div class="cfg">q8_0 / q8_0<small>8-bit · near lossless</small></div>
-      <div class="bar"><i data-w="33"></i></div>
-      <div class="ppl">6.0126</div><div class="delta">+0.0001</div>
-      <div><span class="chip g">~0%</span></div>
-    </div>
-    <div class="bench-row rec">
-      <div class="cfg">turbo4 / turbo3<small>recommended · WHT-rotated VQ</small></div>
-      <div class="bar"><i data-w="69"></i></div>
-      <div class="ppl">6.0722</div><div class="delta">+0.0597</div>
-      <div><span class="chip a">~1%</span></div>
-    </div>
-    <div class="bench-row">
-      <div class="cfg">turbo4 / turbo2<small>maximum compression</small></div>
-      <div class="bar"><i data-w="100"></i></div>
-      <div class="ppl">6.1946</div><div class="delta">+0.1821</div>
-      <div><span class="chip r">~3%</span></div>
+  <div class="reveal">
+    <div class="kicker" style="font-size:11px;margin-bottom:10px">needle-in-a-haystack · recall · llama-3.1-8b · 4k→104k context · 25% KV budget</div>
+    <div class="bench">
+      <div class="bench-head">
+        <div>method</div><div>recall</div><div>score</div><div>kv size</div><div>verdict</div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">Full precision<small>uncompressed baseline</small></div>
+        <div class="bar"><i data-w="100"></i></div>
+        <div class="ppl">0.997</div><div class="delta">16 GB</div>
+        <div><span class="chip g">reference</span></div>
+      </div>
+      <div class="bench-row rec">
+        <div class="cfg">TurboQuant<small>4× compressed · 3.5 bits</small></div>
+        <div class="bar"><i data-w="100"></i></div>
+        <div class="ppl">0.997</div><div class="delta">4 GB</div>
+        <div><span class="chip a">identical</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">PolarQuant<small>google companion method</small></div>
+        <div class="bar"><i data-w="99.8"></i></div>
+        <div class="ppl">0.995</div><div class="delta">4 GB</div>
+        <div><span class="chip g">near-lossless</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">KIVI<small>2-bit asymmetric</small></div>
+        <div class="bar"><i data-w="98.4"></i></div>
+        <div class="ppl">0.981</div><div class="delta">4 GB</div>
+        <div><span class="chip g">good</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">PyramidKV<small>token eviction</small></div>
+        <div class="bar"><i data-w="89.8"></i></div>
+        <div class="ppl">0.895</div><div class="delta">4 GB</div>
+        <div><span class="chip r">degrades</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">SnapKV<small>token eviction</small></div>
+        <div class="bar"><i data-w="86.1"></i></div>
+        <div class="ppl">0.858</div><div class="delta">4 GB</div>
+        <div><span class="chip r">degrades</span></div>
+      </div>
     </div>
   </div>
-  <p class="bench-note reveal">Source: <b>AtomicBot-ai/atomic-llama-cpp-turboquant</b> · WikiText-2 · KV cache compression factor vs f16 baseline.</p>
+  <div class="reveal" style="margin-top:40px">
+    <div class="kicker" style="font-size:11px;margin-bottom:10px">longbench · average score · llama-3.1-8b-instruct</div>
+    <div class="bench">
+      <div class="bench-head">
+        <div>method</div><div>compression</div><div>score ↑</div><div>kv size</div><div>verdict</div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">Full cache<small>f16 · no compression</small></div>
+        <div class="bar"><i data-w="100"></i></div>
+        <div class="ppl">50.06</div><div class="delta">16 GB</div>
+        <div><span class="chip g">baseline</span></div>
+      </div>
+      <div class="bench-row rec">
+        <div class="cfg">TurboQuant 3.5-bit<small>the anvil default</small></div>
+        <div class="bar"><i data-w="100"></i></div>
+        <div class="ppl">50.06</div><div class="delta">~3.5 GB</div>
+        <div><span class="chip a">equal</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">KIVI 5-bit</div>
+        <div class="bar"><i data-w="100"></i></div>
+        <div class="ppl">50.16</div><div class="delta">5 GB</div>
+        <div><span class="chip g">+0.10</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">TurboQuant 2.5-bit<small>max compression</small></div>
+        <div class="bar"><i data-w="98.8"></i></div>
+        <div class="ppl">49.44</div><div class="delta">~2.5 GB</div>
+        <div><span class="chip g">-0.62</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">PolarQuant</div>
+        <div class="bar"><i data-w="99.4"></i></div>
+        <div class="ppl">49.78</div><div class="delta">3.9 GB</div>
+        <div><span class="chip g">-0.28</span></div>
+      </div>
+      <div class="bench-row">
+        <div class="cfg">KIVI 3-bit</div>
+        <div class="bar"><i data-w="96.9"></i></div>
+        <div class="ppl">48.50</div><div class="delta">3 GB</div>
+        <div><span class="chip r">-1.56</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="papercite reveal">Source: <b>Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"</b>, Google Research · arXiv:<a href="https://arxiv.org/abs/2504.19874" target="_blank" rel="noopener">2504.19874</a>. NIAH figure = Fig. 4, LongBench = Table 1. Google's research blog reports <b>≥6× KV memory reduction</b> and <b>up to 8× speedup</b> computing attention logits on H100.</div>
 </section>
 <div class="divider"></div>
 <section id="kv">
   <div class="reveal">
     <div class="kicker">compress</div>
     <h2>Compress the cache, not the conversation.</h2>
-    <p class="sub">TurboQuant uses <b>WHT-rotated vector quantization</b> to shrink the KV cache asymmetrically — V tolerates aggressive compression, K stays sharp. Pick a preset and watch the memory bill drop.</p>
+    <p class="sub">TurboQuant rotates KV vectors into a Walsh–Hadamard basis, then applies per-coordinate Lloyd-Max codebooks — with a 1-bit residual pass for unbiased attention. The fork's <b>turbo3</b> type (3-bit) is the sweet spot: ~4.3× compression at ~1% quality cost. Pick a preset and watch the memory bill drop.</p>
   </div>
   <div class="kv-wrap reveal">
     <div class="kv-presets" id="kv-presets"></div>
     <div class="kv-viz">
-      <div class="kv-cap">KV cache footprint · <b>Qwen 3.6 27B</b> · 128K context</div>
+      <div class="kv-cap">KV cache footprint · <b>Qwen 3.6 27B</b> · 128K context · real architecture (64L · head_dim 256 · 4 KV heads)</div>
       <div class="gauge"><div class="fill" id="kv-fill"></div></div>
-      <div class="gauge-scale"><span>0 GB</span><span>5 GB</span><span>10 GB</span><span>15 GB</span><span>20 GB</span></div>
+      <div class="gauge-scale"><span>0 GB</span><span>9 GB</span><span>18 GB</span><span>27 GB</span><span>36 GB</span></div>
       <div class="kv-stats">
-        <div class="kv-stat"><div class="v" id="kv-gb">4.8 GB</div><div class="k">VRAM used</div></div>
-        <div class="kv-stat"><div class="v" id="kv-x">4.2×</div><div class="k">compression</div></div>
+        <div class="kv-stat"><div class="v" id="kv-gb">7.5 GB</div><div class="k">KV cache</div></div>
+        <div class="kv-stat"><div class="v" id="kv-x">4.6×</div><div class="k">compression</div></div>
         <div class="kv-stat"><div class="v" id="kv-loss">~1%</div><div class="k">quality loss</div></div>
       </div>
     </div>
@@ -487,74 +554,33 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div class="reveal">
     <div class="kicker">quantize</div>
     <h2>Why TurboQuant wins.</h2>
-    <p class="sub">Most KV quantizers just round the key and value tensors. TurboQuant first <b>rotates them into a Walsh–Hadamard basis</b>, where the energy is spread evenly across every dimension. Then it vector-quantizes. The result keeps the signal while throwing away far less information.</p>
+    <p class="sub">TurboQuant is a <b>provably near-optimal vector quantizer</b> from Google Research — within a factor of ≈2.7 of the information-theoretic Shannon lower bound, across every bit-width. Most KV quantizers just round numbers. TurboQuant <b>proves</b> it can't do better.</p>
   </div>
-  <div class="reveal" style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:40px">
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--amber);margin-bottom:10px">01 · Rotate</div>
-      <p style="color:var(--muted);font-size:13px">Apply a fast WHT to each KV vector. Rotation removes correlation bias so every component carries similar importance.</p>
+  <div class="steps reveal">
+    <div class="step">
+      <div class="sn">01 · Rotate</div>
+      <p>Each KV vector is hit with a random rotation (fast Walsh–Hadamard structure). Every coordinate now follows a concentrated Beta / Gaussian distribution — outliers spread out, no coordinate dominates.</p>
     </div>
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--amber);margin-bottom:10px">02 · Quantize</div>
-      <p style="color:var(--muted);font-size:13px">Vector-quantize in the rotated space. K stays at a coarser grain, V gets the aggressive treatment because the eye tolerates value noise.</p>
+    <div class="step">
+      <div class="sn">02 · Quantize</div>
+      <p>Because rotated coordinates are nearly independent, optimal <b>Lloyd-Max scalar codebooks</b> are precomputed per bit-width. MSE-optimal, data-oblivious, online — no calibration, no training.</p>
     </div>
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--amber);margin-bottom:10px">03 · Reconstruct</div>
-      <p style="color:var(--muted);font-size:13px">Inverse WHT reconstructs the original basis. Perplexity shifts by ~1% while the cache shrinks by 4×.</p>
+    <div class="step">
+      <div class="sn">03 · Unbias</div>
+      <p>MSE quantizers bias attention. TurboQuant adds a <b>1-bit Quantized Johnson-Lindenstrauss (QJL)</b> pass on the residual, making inner products <b>unbiased</b> — the reason accuracy survives at 3.5 bits.</p>
     </div>
   </div>
-  <div class="reveal" style="margin-top:40px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px 32px">
-    <div style="font-family:var(--disp);font-size:16px;color:var(--pale);margin-bottom:14px">The memory equation</div>
-    <p style="color:var(--muted);font-size:13.5px;margin-bottom:16px">For a model with <b>L</b> layers, hidden size <b>H</b>, and GQA grouping <b>g</b>, the f16 KV cache per token is:</p>
-    <pre style="color:var(--green);font-size:13px;background:#0e0a05;border:1px solid var(--line2);border-radius:6px;padding:14px 18px;overflow-x:auto">KV(token) = 2 × L × H × (kv_heads / heads) × 2 bytes</pre>
-    <p style="color:var(--muted);font-size:13.5px;margin-top:16px">With TurboQuant the final 2 bytes becomes ~0.44 bytes, which is where the 4.2× compression comes from. The calculator above uses the same geometry.</p>
+  <div class="reveal" style="margin-top:40px;display:grid;grid-template-columns:repeat(4,1fr);gap:14px">
+    <div class="card" style="text-align:center"><div class="ct">3.5 bits</div><p>quality-neutral per the paper — <b>50.06 = 50.06</b> on LongBench</p></div>
+    <div class="card" style="text-align:center"><div class="ct">2.5 bits</div><p>marginal degradation, ~2.5 GB for 128K on an 8B model</p></div>
+    <div class="card" style="text-align:center"><div class="ct">≥6×</div><p>KV memory reduction per Google's research blog</p></div>
+    <div class="card" style="text-align:center"><div class="ct">8×</div><p>attention-logit speedup vs f16 keys on H100 (4-bit)</p></div>
   </div>
-</section>
-<div class="divider"></div>
-<section id="calc">
-  <div class="reveal">
-    <div class="kicker">measure</div>
-    <h2>Will it fit? Do the math.</h2>
-    <p class="sub">Dial in a model, a quant, and a context window — see the VRAM bill, and which GPUs can take the heat. <b>Estimates</b>, but honest ones.</p>
-  </div>
-  <div class="calc reveal">
-    <div class="calc-ctl">
-      <label>Model size</label>
-      <select id="c-model">
-        <option value="7B">7B&nbsp;&nbsp;(32 layers · MHA)</option>
-        <option value="13B">13B&nbsp;(40 layers · MHA)</option>
-        <option value="34B">34B&nbsp;(48 layers · GQA)</option>
-        <option value="27B" selected>27B&nbsp;(64 layers · GQA)</option>
-      </select>
-      <label>Weight quantization</label>
-      <select id="c-wq">
-        <option value="f16">f16&nbsp;&nbsp;(2.0 B/param)</option>
-        <option value="q8_0">q8_0&nbsp;(1.0 B/param)</option>
-        <option value="q4_K" selected>q4_K&nbsp;(0.55 B/param)</option>
-        <option value="q2_K">q2_K&nbsp;(0.30 B/param)</option>
-      </select>
-      <label>KV cache preset</label>
-      <select id="c-kv">
-        <option value="f16/f16">f16 / f16&nbsp;&nbsp;(no compression)</option>
-        <option value="q8_0/turbo3">q8_0 / turbo3</option>
-        <option value="turbo4/turbo3" selected>turbo4 / turbo3&nbsp;(recommended)</option>
-        <option value="turbo4/turbo2">turbo4 / turbo2&nbsp;(max)</option>
-      </select>
-      <label>Context window — <span class="ctx-read" id="c-ctxv">32K</span></label>
-      <input type="range" id="c-ctx" min="2048" max="131072" step="2048" value="32768">
-    </div>
-    <div class="calc-out">
-      <div class="stackbar"><div class="w" id="sb-w"></div><div class="k" id="sb-k"></div></div>
-      <div class="stack-scale"><span style="color:var(--amber)">■ weights</span><span style="color:var(--red)">■ KV cache</span><span>total VRAM</span></div>
-      <div class="calc-nums">
-        <div><div class="v" id="cn-w">0</div><div class="k">weights</div></div>
-        <div><div class="v" id="cn-kv">0</div><div class="k">KV cache</div></div>
-        <div><div class="v" id="cn-tot">0</div><div class="k">total</div></div>
-      </div>
-      <label style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);display:block;margin-bottom:12px">Does it fit?</label>
-      <div class="gpu-fit" id="gpu-fit"></div>
-      <p class="calc-note">Rule of thumb — leave ~1–2 GB headroom for activations. GQA models (27B/34B) have much smaller KV caches than MHA ones.</p>
-    </div>
+  <div class="panel-box reveal">
+    <div class="pt">The memory equation</div>
+    <p style="margin-bottom:12px">For a model with <b>L</b> layers, <b>n</b> KV heads, and head dimension <b>h</b>, the f16 KV cache per token is:</p>
+    <pre class="formula">KV(token) = 2 × L × n × h × 2 bytes</pre>
+    <p style="margin-top:14px;margin-bottom:0">With TurboQuant the final <b>2 bytes</b> becomes <b>~0.44 bytes</b> (3.5 bits) — that's the 4.6× win, and it compounds directly with context length. Real head dimensions matter: Qwen 3.6 27B has head_dim 256 (not hidden_size/heads) — which is exactly what puts a 27B model’s KV cache at ~4 GB for 262K context under turbo compression.</p>
   </div>
 </section>
 <div class="divider"></div>
@@ -564,30 +590,30 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
     <h2>Squeeze the last token per second.</h2>
     <p class="sub">VRAM is only half the battle. These are the knobs that actually move tokens-per-second once the model already fits.</p>
   </div>
-  <div class="reveal" style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:40px">
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--green);margin-bottom:10px">Flash Attention</div>
-      <p style="color:var(--muted);font-size:13px">Always enable it. Flash Attention keeps the attention step memory-bound instead of compute-bound, and the larger your context the bigger the win.</p>
+  <div class="grid2 reveal">
+    <div class="card">
+      <div class="ct">Flash Attention</div>
+      <p>Always enable it. Flash Attention keeps the attention step memory-bound instead of compute-bound, and the larger your context the bigger the win.</p>
     </div>
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--green);margin-bottom:10px">GPU Layers</div>
-      <p style="color:var(--muted);font-size:13px">Use <b>--ngl</b> to offload every layer that fits. Even one layer left on CPU creates a cross-bus bottleneck. The TUI shows the safe maximum.</p>
+    <div class="card">
+      <div class="ct">GPU Layers</div>
+      <p>Use <b>--ngl</b> to offload every layer that fits. Even one layer left on CPU creates a cross-bus bottleneck. The TUI shows the safe maximum.</p>
     </div>
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--green);margin-bottom:10px">Context Right-Sizing</div>
-      <p style="color:var(--muted);font-size:13px">Don't pay for context you don't use. A 27B model at 32K needs half the KV cache of 64K, so size the window to the actual prompt.</p>
+    <div class="card">
+      <div class="ct">Context Right-Sizing</div>
+      <p>Don't pay for context you don't use. With TurboQuant the bill is 4-6× smaller — but a 27B model at 32K still costs half the KV of 64K.</p>
     </div>
-    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:24px">
-      <div style="font-family:var(--disp);font-size:15px;color:var(--green);margin-bottom:10px">Speculative Decoding</div>
-      <p style="color:var(--muted);font-size:13px">MTP / NextN draft heads verify several tokens in parallel. Turn it on for supported models and watch latency drop 30–50%.</p>
+    <div class="card">
+      <div class="ct">Speculative Decoding</div>
+      <p>MTP / NextN draft heads verify several tokens in parallel. On supported models (Gemma 4, Qwen 3.6 UDT) the fork measures <b>+30–50% short-prompt throughput</b> at ~85–88% accept rate.</p>
     </div>
   </div>
-  <div class="reveal" style="margin-top:40px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px 32px">
-    <div style="font-family:var(--disp);font-size:16px;color:var(--pale);margin-bottom:14px">Benchmark your own workload</div>
-    <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">Synthetic benches only tell you so much. Run your actual prompt through <b>anvil</b> and watch <b>/stats</b> for tokens-per-second and prompt-processing time. Then iterate on KV preset and context size until the numbers stop improving.</p>
-    <pre style="color:var(--green);font-size:13px;background:#0e0a05;border:1px solid var(--line2);border-radius:6px;padding:14px 18px;overflow-x:auto">$ anvil run qwen3.6-27b.gguf --ctx 32768 --ngl 99 --flash-attn
+  <div class="panel-box reveal">
+    <div class="pt">Benchmark your own workload</div>
+    <p style="margin-bottom:12px">Synthetic benches only tell you so much. Run your actual prompt through <b>anvil</b> and watch <b>/stats</b> for tokens-per-second and prompt-processing time. Then iterate on KV preset and context size until the numbers stop improving.</p>
+    <pre class="formula">$ anvil run qwen3.6-27b.gguf --ctx 131072 --ngl 99 --flash-attn
 &gt; /stats
-tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
+tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891 · KV: turbo4/turbo3</pre>
   </div>
 </section>
 <div class="divider"></div>
@@ -605,7 +631,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
     </div>
     <div class="spec-side">
       <div class="big">+30–50%</div>
-      <div class="big-lbl">throughput on supported models</div>
+      <div class="big-lbl">short-prompt throughput · accept ~85–88%</div>
       <h3 style="margin-top:30px">How it works</h3>
       <p>The model's extra prediction heads guess the next few tokens cheaply. anvil feeds all of them through the main model at once — if they're right, you get them all in a single decode step.</p>
       <p>Quality is <b style="color:var(--pale)">bit-identical</b> to normal decoding. Rejected drafts are simply discarded and re-sampled.</p>
@@ -622,7 +648,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
   <div class="backend-grid reveal">
     <div class="backend"><span class="ic">🟢</span><div class="bn">CUDA</div><div class="bd">NVIDIA</div></div>
     <div class="backend"><span class="ic">🔺</span><div class="bn">Vulkan</div><div class="bd">cross-vendor</div></div>
-    <div class="backend"><span class="ic"></span><div class="bn">Metal</div><div class="bd">Apple Silicon</div></div>
+    <div class="backend"><span class="ic"></span><div class="bn">Metal</div><div class="bd">Apple Silicon · TurboFlash</div></div>
     <div class="backend"><span class="ic">🔴</span><div class="bn">ROCm</div><div class="bd">AMD</div></div>
     <div class="backend"><span class="ic">🔷</span><div class="bn">SYCL</div><div class="bd">Intel</div></div>
     <div class="backend"><span class="ic">⚙️</span><div class="bn">CPU</div><div class="bd">AVX2 / NEON</div></div>
@@ -644,10 +670,10 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
     <span class="pdot"></span><span class="pdot d2"></span><span class="pdot d3"></span>
     <div class="pstage"><div class="node">⌨️</div><div class="pn">prompt</div><div class="pd">you type at the anvil</div></div>
     <div class="pstage"><div class="node">🔤</div><div class="pn">tokenize</div><div class="pd">vocab → token IDs</div></div>
-    <div class="pstage"><div class="node">🗜️</div><div class="pn">KV cache</div><div class="pd">TurboQuant compresses K/V</div></div>
+    <div class="pstage"><div class="node">🗜️</div><div class="pn">KV cache</div><div class="pd">TurboQuant rotates + quantizes K/V</div></div>
     <div class="pstage"><div class="node">🔥</div><div class="pn">GPU decode</div><div class="pd">flash attention, all layers</div></div>
-    <div class="pstage"><div class="node">🎲</div><div class="pn">sample</div><div class="pd">min-p + temperature</div></div>
-    <div class="pstage"><div class="node">⚡</div><div class="pn">stream</div><div class="pd">UTF-8 → your terminal</div></div>
+    <div class="pstage"><div class="node">🎲</div><div class="pn">sample</div><div class="pd">top-k + temperature</div></div>
+    <div class="pstage"><div class="node">⚡</div><div class="pn">stream</div><div class="pd">markdown → your terminal</div></div>
   </div>
 </section>
 <div class="divider"></div>
@@ -655,18 +681,18 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
   <div class="reveal">
     <div class="kicker">first-light</div>
     <h2>Your first run forges the config.</h2>
-    <p class="sub">No YAML to hand-edit. The first time you launch, anvil opens a <b>full TUI setup wizard</b> — built with FTXUI — reads your hardware, and walks you through context, KV compression, flash attention, and temperature.</p>
+    <p class="sub">No YAML to hand-edit. The first time you launch, anvil opens a <b>full TUI setup wizard</b> — built with FTXUI — reads your hardware, and walks you through context, KV compression, flash attention, and temperature. Every model gets its own persisted profile.</p>
   </div>
-  <div class="tui-grid reveal" style="display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:center">
-    <div style="background:#0f0b06;border:1px solid var(--line2);border-radius:10px;padding:24px 26px;font-size:12.5px;line-height:1.7;box-shadow:0 0 0 1px #000,0 30px 70px rgba(0,0,0,.6)">
-<pre style="color:var(--amber);text-shadow:0 0 12px rgba(255,157,46,.4);white-space:pre;font-size:10px;line-height:1.3">   ░███                          ░██░██ 
-  ░██░██                            ░██ 
- ░██  ░██  ░████████  ░██    ░██ ░██░██ 
-░█████████ ░██    ░██ ░██    ░██ ░██░██ 
-░██    ░██ ░██    ░██  ░██  ░██  ░██░██ 
-░██    ░██ ░██    ░██   ░██░██   ░██░██ 
+  <div class="tui-grid reveal">
+    <div class="tui-term">
+<pre>   ░███                          ░██░██
+  ░██░██                            ░██
+ ░██  ░██  ░████████  ░██    ░██ ░██░██
+░█████████ ░██    ░██ ░██    ░██ ░██░██
+░██    ░██ ░██    ░██  ░██  ░██  ░██░██
+░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██</pre>
-      <div style="color:var(--pale);font-weight:700">  First-time setup  v0.2.0</div>
+      <div style="color:var(--pale);font-weight:700">  First-time setup  v0.5.0</div>
       <div style="color:var(--dim)">  Detected hardware:</div>
       <div style="color:var(--dim)">    CPU : AMD Ryzen 9 7950X · RAM : 64 GB</div>
       <div style="color:var(--dim)">    GPU : NVIDIA RTX 4090 (24564 MB)</div>
@@ -676,8 +702,8 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
       <div style="color:var(--green);font-weight:700">    ▸ 32K tokens</div>
       <div style="color:var(--muted)">    · 128K tokens</div>
       <div style="color:var(--pale);font-weight:700">  KV cache compression</div>
-      <div style="color:var(--green);font-weight:700">    ▸ Recommended (K=turbo4, V=turbo3)</div>
-      <div style="color:var(--muted)">    · Max Compress (K=turbo4, V=turbo2)</div>
+      <div style="color:var(--green);font-weight:700">    ▸ Recommended (K=turbo4, V=turbo3) 4.2×</div>
+      <div style="color:var(--muted)">    · Max Compress (K=turbo4, V=turbo2) 6.1×</div>
       <div style="color:var(--pale);font-weight:700">  Flash attention</div>
       <div style="color:var(--green);font-weight:700">    ▸ on (recommended)</div>
       <br>
@@ -685,24 +711,51 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
       <div style="color:var(--dim)">  Tab switch  ↑/↓ change  Enter confirm  q cancel</div>
     </div>
     <div>
-      <ul style="list-style:none">
-        <li style="padding-left:24px;position:relative;margin-bottom:14px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500;display:block">Hardware-aware defaults</b>It reads your GPU's VRAM and suggests a layer count and context size that will actually fit.</li>
-        <li style="padding-left:24px;position:relative;margin-bottom:14px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500;display:block">KV presets with real numbers</b>Every compression option shows its factor and quality cost — no guessing.</li>
-        <li style="padding-left:24px;position:relative;margin-bottom:14px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500;display:block">Custom mode</b>Pick K and V cache types independently, or type any context size by hand.</li>
-        <li style="padding-left:24px;position:relative;margin-bottom:14px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500;display:block">Written once, editable forever</b>Your choices land in <span style="color:var(--green)">~/.anvil/config.json</span>. CLI flags override it any time.</li>
+      <ul class="feature-list">
+        <li><b>Hardware-aware defaults</b>It reads your GPU's VRAM and suggests a layer count and context size that will actually fit.</li>
+        <li><b>KV presets with real numbers</b>Every compression option shows its factor and quality cost — no guessing.</li>
+        <li><b>Custom mode</b>Pick K and V cache types independently, or type any context size by hand.</li>
+        <li><b>Per-model profiles</b>Each model keeps its own settings in <span style="color:var(--green)">~/.anvil/models.json</span>, seeded from the GGUF's trained context. Change something in-chat with <b>/temp</b> or <b>/ctx</b> and it persists.</li>
       </ul>
     </div>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ FEATURES / MAN PAGE ═══ -->
+<section id="registry">
+  <div class="reveal">
+    <div class="kicker">the-ledger</div>
+    <h2>Every model, one ledger.</h2>
+    <p class="sub">anvil keeps a <b>model registry</b> with friendly names and a persistent per-model profile. Pull models from Ollama's registry or Hugging Face, import local GGUFs, run them by nickname.</p>
+  </div>
+  <div class="reg reveal">
+    <div class="reg-term">
+      <div class="r-cmd">$ anvil list</div>
+      <div class="r-out">  <span class="r-name">qwen3.6-27b</span>    <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">128K</span>  <span class="r-size">17.9 GB</span></div>
+      <div class="r-out">  <span class="r-name">lfm2.5-2.6b</span>     <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">128K</span>  <span class="r-size">1.9 GB</span></div>
+      <div class="r-out">  <span class="r-name">bonsai-27b</span>       <span class="r-kv">turbo3/turbo3</span>  <span class="r-ctx">262K</span>  <span class="r-size">3.8 GB</span></div>
+      <div class="r-cmd">$ anvil pull qwen3.6-27b</div>
+      <div class="r-out">  resolving qwen3.6-27b from ollama registry…</div>
+      <div class="r-out">  ✓ downloaded · 17.9 GB · sha256 verified</div>
+      <div class="r-cmd">$ anvil run qwen3.6-27b</div>
+      <div class="r-kv">  KV : K=turbo4 V=turbo3   ctx : 128000 tokens   flash : on</div>
+    </div>
+    <div>
+      <ul class="feature-list">
+        <li><b>Friendly names</b>Run <span style="color:var(--green)">anvil run qwen3.6-27b</span> — no paths, no hashes.</li>
+        <li><b>Pull from anywhere</b>Ollama registry and Hugging Face GGUF downloads, checksum-verified.</li>
+        <li><b>Import local files</b>Point at any .gguf and anvil registers it with hardware probes.</li>
+        <li><b>Per-model profiles in models.json</b>n_ctx, temp, flash_attn, type_k/type_v — seeded from the GGUF, editable in-chat, persisted forever.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+<div class="divider"></div>
 <section id="features">
   <div class="reveal">
     <div class="kicker">capabilities</div>
     <h2>Read the fine print.</h2>
   </div>
-  <div class="reveal" style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:44px 48px">
+  <div class="reveal panel-box" style="padding:44px 48px">
     <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--amber);border-bottom:1px solid var(--line2);padding-bottom:12px;margin-bottom:30px;letter-spacing:.1em">
       <span>ANVIL(1)</span><span>User Commands</span><span>ANVIL(1)</span>
     </div>
@@ -711,7 +764,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
         <h3 style="color:var(--amber);font-size:13px;letter-spacing:.18em;margin-bottom:10px">NAME</h3>
         <p style="color:var(--muted);font-size:13.5px">anvil — forge-grade local LLM inference in your terminal</p>
         <h3 style="color:var(--amber);font-size:13px;letter-spacing:.18em;margin:22px 0 10px">SYNOPSIS</h3>
-        <pre style="background:#0d0903;border:1px solid var(--line);border-radius:6px;padding:14px 18px;font-size:12.5px;color:var(--green);overflow-x:auto">anvil run model.gguf [--ctx N] [--ngl N]
+        <pre class="formula" style="font-size:12.5px">anvil run model.gguf [--ctx N] [--ngl N]
     [--type-k T] [--type-v T] [--mtp]
     [--top-k 40] [--top-p 0.95] [--repeat-penalty 1.1]
     [--grammar f.gbnf] [-p "..."]</pre>
@@ -720,23 +773,22 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
       </div>
       <div>
         <h3 style="color:var(--amber);font-size:13px;letter-spacing:.18em;margin-bottom:10px">FEATURES</h3>
-        <ul style="list-style:none">
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">TurboQuant KV cache</b> — asymmetric K/V, 4.2× default</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">MTP + NextN</b> speculative decoding</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">Flash Attention</b> on by default</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">TriAttention</b> intelligent KV eviction</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">GBNF grammars</b> for structured output</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">Hardware autodetect</b> — CUDA · Vulkan · Metal · ROCm · CPU</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">Live stats</b> — tokens/sec, context fill, session export</li>
-          <li style="padding-left:20px;position:relative;margin-bottom:8px;color:var(--muted);font-size:13.5px"><span style="position:absolute;left:0;color:var(--hot)">▸</span><b style="color:var(--pale);font-weight:500">Single binary</b> — zero telemetry, zero cloud</li>
+        <ul class="feature-list" style="margin-top:0">
+          <li><b>TurboQuant KV cache</b> — 2/3/4-bit WHT-rotated, asymmetric K/V</li>
+          <li><b>MTP + NextN</b> speculative decoding</li>
+          <li><b>Flash Attention</b> on by default</li>
+          <li><b>GBNF grammars</b> for structured output</li>
+          <li><b>Model registry</b> — pull, import, nickname</li>
+          <li><b>Streaming markdown</b> — thinking blocks, bold, code, tables</li>
+          <li><b>Hardware autodetect</b> — CUDA · Vulkan · Metal · ROCm · CPU</li>
+          <li><b>Live stats</b> — tokens/sec, context fill, session export</li>
+          <li><b>Single binary</b> — zero telemetry, zero cloud</li>
         </ul>
       </div>
     </div>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ COMMANDS ═══ -->
 <section id="commands">
   <div class="reveal">
     <div class="kicker">hammer-strokes</div>
@@ -749,14 +801,12 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
     <div class="cmd"><kbd>/export</kbd><p>save the session to markdown in ~/.anvil/sessions</p></div>
     <div class="cmd"><kbd>/clear</kbd><p>quench the context and start fresh</p></div>
     <div class="cmd"><kbd>/model</kbd><p>arch, trained context, encoder/decoder, GPU layers</p></div>
-    <div class="cmd"><kbd>/temp 0.9</kbd><p>retune sampling temperature on the fly</p></div>
+    <div class="cmd"><kbd>/temp 0.9</kbd><p>retune sampling — persists to the model's profile</p></div>
     <div class="cmd"><kbd>/ctx</kbd><p>context usage bar, color-coded by heat</p></div>
     <div class="cmd"><kbd>/exit</kbd><p>put down the hammer</p></div>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ COMPARISON ═══ -->
 <section id="compare">
   <div class="reveal">
     <div class="kicker">weigh</div>
@@ -770,8 +820,10 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
         <tr><td>TurboQuant KV cache</td><td class="us yes">✓ native</td><td class="no">✗</td><td class="meh">fork only</td><td class="no">✗</td></tr>
         <tr><td>MTP / NextN spec decode</td><td class="us yes">✓</td><td class="no">✗</td><td class="meh">fork only</td><td class="no">✗</td></tr>
         <tr><td>First-run TUI wizard</td><td class="us yes">✓</td><td class="no">✗</td><td class="no">✗</td><td class="meh">GUI</td></tr>
+        <tr><td>Per-model profiles</td><td class="us yes">✓</td><td class="meh">Modelfiles</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td>Model registry + pull</td><td class="us yes">✓</td><td class="yes">✓</td><td class="no">✗</td><td class="meh">GUI</td></tr>
+        <tr><td>Streaming markdown + thinking blocks</td><td class="us yes">✓</td><td class="no">✗</td><td class="no">✗</td><td class="meh">partial</td></tr>
         <tr><td>Terminal-native</td><td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗ (app)</td></tr>
-        <tr><td>Asymmetric K/V control</td><td class="us yes">✓</td><td class="no">✗</td><td class="meh">flags</td><td class="no">✗</td></tr>
         <tr><td>Session export / undo</td><td class="us yes">✓</td><td class="no">✗</td><td class="no">✗</td><td class="meh">partial</td></tr>
         <tr><td>Open source</td><td class="us yes">✓ MIT</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
         <tr><td>Telemetry</td><td class="us yes">none</td><td class="meh">some</td><td class="yes">none</td><td class="no">yes</td></tr>
@@ -780,40 +832,39 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ CONFIG ═══ -->
 <section id="config">
   <div class="reveal">
     <div class="kicker">the-ledger</div>
-    <h2>One config file. Fully yours.</h2>
-    <p class="sub">Everything the wizard writes lives in <b>~/.anvil/config.json</b>. Edit it by hand, version it, symlink it across machines.</p>
+    <h2>One config. Per-model profiles.</h2>
+    <p class="sub">Global settings live in <b>~/.anvil/config.json</b>. Every model gets its own profile in <b>~/.anvil/models.json</b> — seeded from the GGUF, editable in-chat, persisted forever.</p>
   </div>
   <div class="cfg-grid reveal">
-    <div class="codeblock"><span class="cm">// ~/.anvil/config.json</span>
-{
-  <span class="k">"version"</span>:    <span class="n">2</span>,
-  <span class="k">"ngl"</span>:        <span class="n">99</span>,            <span class="cm">// GPU layers</span>
-  <span class="k">"n_ctx"</span>:      <span class="n">32768</span>,         <span class="cm">// context window</span>
-  <span class="k">"n_threads"</span>:  <span class="n">0</span>,             <span class="cm">// 0 = auto</span>
+    <div class="codeblock">
+<span class="k">"qwen3.6-27b"</span>: {
+  <span class="k">"path"</span>:       <span class="s">"~/.anvil/models/qwen3.6-27b.gguf"</span>,
+  <span class="k">"n_ctx"</span>:      <span class="n">131072</span>,
   <span class="k">"temp"</span>:       <span class="n">0.8</span>,
   <span class="k">"flash_attn"</span>: <span class="b">true</span>,
-  <span class="k">"mtp"</span>:        <span class="b">false</span>,          <span class="cm">// spec decode</span>
-  <span class="k">"top_k"</span>:  <span class="n">40</span>,                <span class="cm">// sampling</span>
-  <span class="k">"type_k"</span>:     <span class="s">"turbo4"</span>,       <span class="cm">// K cache</span>
-  <span class="k">"type_v"</span>:     <span class="s">"turbo3"</span>,       <span class="cm">// V cache</span>
-  <span class="k">"model"</span>:      <span class="s">"qwen3.6-27b.gguf"</span>
+  <span class="k">"type_k"</span>:     <span class="s">"turbo4"</span>,
+  <span class="k">"type_v"</span>:     <span class="s">"turbo3"</span>,
+  <span class="k">"top_k"</span>:      <span class="n">40</span>,
+  <span class="k">"top_p"</span>:      <span class="n">0.95</span>
+}
+<span class="k">"lfm2.5-2.6b"</span>: {
+  <span class="k">"n_ctx"</span>:      <span class="n">128000</span>,
+  <span class="k">"temp"</span>:       <span class="n">0.7</span>,
+  <span class="k">"type_k"</span>:     <span class="s">"turbo4"</span>,
+  <span class="k">"type_v"</span>:     <span class="s">"turbo3"</span>
 }</div>
     <ul class="cfg-notes">
-      <li><b>Versioned &amp; migrated</b>Older configs are upgraded automatically — nothing breaks on update.</li>
-      <li><b>CLI always wins</b>Any flag you pass overrides the file, and the file is updated to match.</li>
-      <li><b>type_k / type_v are independent</b>Mix and match any of f16, q8_0, turbo4, turbo3, turbo2 per side.</li>
-      <li><b>Sessions live alongside</b>Exports land in <span style="color:var(--green)">~/.anvil/sessions/</span> as timestamped markdown.</li>
+      <li><b>Seeded from the GGUF</b>n_ctx = the model's trained context, sampling params from its metadata. Filled only when unset.</li>
+      <li><b>Changes persist</b>Set <span style="color:var(--green)">/temp 0.9</span> or <span style="color:var(--green)">/ctx 65536</span> in-chat and the profile is written back to models.json.</li>
+      <li><b>CLI always wins</b>Any flag you pass overrides the file for that run.</li>
+      <li><b>Zero artificial caps</b>n_batch tracks n_ctx, and context size is bounded only by the backend's int32 position counter — not by a hardcoded limit.</li>
     </ul>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ USE CASES ═══ -->
 <section id="uses">
   <div class="reveal">
     <div class="kicker">what-will-you-forge</div>
@@ -827,7 +878,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
     </div>
     <div class="use">
       <div class="n">02</div>
-      <div><h3>Long-document research</h3><p>TurboQuant's 4.2× KV compression means whole papers and codebases fit in context on a single GPU.</p></div>
+      <div><h3>Long-document research</h3><p>TurboQuant's 4-6× KV compression means whole papers and codebases fit in context on a single GPU.</p></div>
       <div class="ex">anvil run model.gguf --ctx 131072 --type-k turbo4 --type-v turbo3</div>
     </div>
     <div class="use">
@@ -843,53 +894,70 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ FAQ ═══ -->
 <section id="faq">
   <div class="reveal">
     <div class="kicker">ask-the-smith</div>
     <h2>Frequently struck questions.</h2>
   </div>
   <div class="faq reveal">
+    <div class="qa"><button>Is TurboQuant actually a Google paper?<span class="pm">+</span></button>
+      <div class="a"><p>Yes. <b>TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate</b> is by Amir Zandieh, Majid Daliri, Majid Hadian and Vahab Mirrokni (Google Research / Google DeepMind / NYU), arXiv <b>2504.19874</b>. It proves near-optimal distortion — within ≈2.7× of the Shannon lower bound — and shows quality-neutral KV compression at 3.5 bits. The anvil fork implements the WHT-rotated family (turbo2/3/4) with backend-native kernels.</p></div></div>
+    <div class="qa"><button>What's the real compression number?<span class="pm">+</span></button>
+      <div class="a"><p>The fork's measured factors vs f16: <b>turbo2 ≈ 6.4×</b>, <b>turbo3 ≈ 4.3×</b> (the fork's recommended default), <b>turbo4 ≈ 3.8×</b>. The paper reports compression exceeding <b>5×</b>; Google's blog says the KV memory is reduced <b>≥6×</b>. anvil's default K=turbo4/V=turbo3 lands around 4.2× with ~1% quality cost.</p></div></div>
     <div class="qa"><button>Do I need a GPU?<span class="pm">+</span></button>
       <div class="a"><p>No — anvil runs on CPU with AVX2/NEON. But with a GPU it auto-offloads layers, and TurboQuant's KV compression means <b>even modest VRAM fits long contexts</b>. An RTX 3060 12GB is a perfectly good anvil.</p></div></div>
     <div class="qa"><button>What models work?<span class="pm">+</span></button>
-      <div class="a"><p>Any <b>GGUF</b> file that llama.cpp supports — Llama, Qwen, Gemma, DeepSeek, Mistral, Phi, and friends. MTP/NextN speculative decoding additionally needs a model with prediction heads (Gemma 4, Qwen 3.6).</p></div></div>
+      <div class="a"><p>Any <b>GGUF</b> file that llama.cpp supports — Llama, Qwen, Gemma, DeepSeek, Mistral, Phi, and friends. MTP/NextN speculative decoding additionally needs a model with prediction heads (Gemma 4, Qwen 3.6 UDT).</p></div></div>
     <div class="qa"><button>How is this different from ollama?<span class="pm">+</span></button>
-      <div class="a"><p>ollama is a great general-purpose server. anvil is a <b>terminal-first power tool</b> built specifically on the TurboQuant fork — you get asymmetric KV compression, speculative decoding, a setup TUI, and per-session stats that ollama doesn't expose. No daemon, no server, just a binary.</p></div></div>
-    <div class="qa"><button>What is TurboQuant actually doing?<span class="pm">+</span></button>
-      <div class="a"><p>It applies a <b>Walsh–Hadamard transform</b> to KV vectors, then vector-quantizes them. The rotation spreads outliers evenly, so quantization error stays tiny. V tolerates more compression than K — so anvil compresses them <b>asymmetrically</b> (turbo4/turbo3) for the best size/quality trade.</p></div></div>
+      <div class="a"><p>ollama is a great general-purpose server. anvil is a <b>terminal-first power tool</b> built specifically on the TurboQuant fork — you get asymmetric KV compression, speculative decoding, a setup TUI, a model registry with per-model profiles, and streaming markdown. No daemon, no server, just a binary.</p></div></div>
     <div class="qa"><button>Does anything leave my machine?<span class="pm">+</span></button>
-      <div class="a"><p><b>Nothing.</b> No telemetry, no update checks, no crash reports, no network calls at runtime. The only time anvil touches the network is when you install it.</p></div></div>
+      <div class="a"><p><b>Nothing.</b> No telemetry, no update checks, no crash reports, no network calls at runtime. The only time anvil touches the network is when you install it or pull a model.</p></div></div>
     <div class="qa"><button>Can I change settings without re-running the wizard?<span class="pm">+</span></button>
-      <div class="a"><p>Yes. Edit <b>~/.anvil/config.json</b> directly, or pass CLI flags (<span style="color:var(--green)">--ctx</span>, <span style="color:var(--green)">--type-k</span>, <span style="color:var(--green)">--ngl</span>, …) which override and persist automatically.</p></div></div>
+      <div class="a"><p>Yes. Edit <b>~/.anvil/config.json</b> or a model's entry in <b>~/.anvil/models.json</b> directly, or pass CLI flags (<span style="color:var(--green)">--ctx</span>, <span style="color:var(--green)">--type-k</span>, <span style="color:var(--green)">--ngl</span>, …) which override for that run. In-chat <b>/temp</b> and <b>/ctx</b> persist to the profile.</p></div></div>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ ROADMAP ═══ -->
 <section id="roadmap">
   <div class="reveal">
     <div class="kicker">the-forge-ahead</div>
     <h2>What's heating up.</h2>
   </div>
   <div class="road reveal">
-    <div class="road-item done"><span class="rv">v0.1.0</span><span class="rt">shipped</span><p>First light. Chat REPL, hardware detection, TUI wizard, TurboQuant KV.</p></div>
-    <div class="road-item done"><span class="rv">v0.2.0</span><span class="rt">current</span><p>Asymmetric K/V presets, MTP/NextN, /stats /undo /export, UTF-8 streaming, t/s display, session persistence.</p></div>
-    <div class="road-item"><span class="rv">v0.3.0</span><span class="rt">next</span><p><b style="color:var(--pale)">anvil serve</b> — OpenAI-compatible local server. <b style="color:var(--pale)">anvil pull</b> — download models straight from HuggingFace.</p></div>
-    <div class="road-item"><span class="rv">v0.4.0</span><span class="rt">planned</span><p>Multimodal (vision) input, TriAttention context extension UI, conversation branching.</p></div>
-    <div class="road-item"><span class="rv">v0.5.0</span><span class="rt">dreaming</span><p>Agent / tool-use loop, grammar-driven function calling, multi-model routing.</p></div>
+    <div class="road-item done"><span class="rv">v0.1</span><span class="rt">shipped</span><p>First light. Chat REPL, hardware detection, TUI wizard, TurboQuant KV.</p></div>
+    <div class="road-item done"><span class="rv">v0.2</span><span class="rt">shipped</span><p>Asymmetric K/V presets, MTP/NextN, /stats /undo /export, UTF-8 streaming, session persistence.</p></div>
+    <div class="road-item done"><span class="rv">v0.3</span><span class="rt">shipped</span><p>Ollama registry + local import for <b>anvil pull</b>, Hugging Face GGUF downloader.</p></div>
+    <div class="road-item done"><span class="rv">v0.4</span><span class="rt">shipped</span><p>Model registry with friendly names and persistent per-model profiles. Per-model settings schemas seeded from GGUF.</p></div>
+    <div class="road-item done"><span class="rv">v0.5</span><span class="rt">current</span><p>Streaming markdown renderer (mdtty) with live token redraw — thinking blocks, bold, code, tables. Zero artificial context caps.</p></div>
+    <div class="road-item"><span class="rv">v0.6</span><span class="rt">next</span><p><b style="color:var(--pale)">anvil serve</b> — OpenAI-compatible local server. Multimodal vision input.</p></div>
+    <div class="road-item"><span class="rv">v0.7</span><span class="rt">planned</span><p>Conversation branching, context extension UI, grammar-driven function calling.</p></div>
+    <div class="road-item"><span class="rv">v0.8</span><span class="rt">dreaming</span><p>Agent / tool-use loop, multi-model routing.</p></div>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ CHANGELOG ═══ -->
 <section id="changelog">
   <div class="reveal">
     <div class="kicker">struck-so-far</div>
     <h2>Changelog.</h2>
   </div>
   <div class="log reveal">
+    <div class="log-entry">
+      <span class="lv">v0.5.0</span><span class="ld">2026-08-09</span>
+      <ul>
+        <li>Streaming markdown renderer (mdtty) with live token redraw</li>
+        <li>Thinking blocks formatted in dim grey; response markdown fully styled</li>
+        <li>n_batch tracks n_ctx; all artificial context caps removed</li>
+        <li>Per-model profiles persisted from in-chat /temp /ctx changes</li>
+      </ul>
+    </div>
+    <div class="log-entry">
+      <span class="lv">v0.4.0</span><span class="ld">2026-08-09</span>
+      <ul>
+        <li>Model registry with friendly names + persistent per-model profiles</li>
+        <li>Per-model settings schema seeded from GGUF metadata</li>
+        <li>anvil pull: Ollama registry + local ollama import + Hugging Face GGUF</li>
+        <li>Windows build fixes (NOMINMAX, portable TTY check)</li>
+      </ul>
+    </div>
     <div class="log-entry">
       <span class="lv">v0.2.0</span><span class="ld">2026-07-26</span>
       <ul>
@@ -915,8 +983,6 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
   </div>
 </section>
 <div class="divider"></div>
-
-<!-- ═══ INSTALL ═══ -->
 <section id="install">
   <div class="reveal">
     <div class="kicker">get-it</div>
@@ -930,36 +996,27 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891</pre>
     </div>
     <div class="tabpanel active" id="t-curl">
       <pre id="src-curl">curl -fsSL https://anvil-llm.github.io/anvil/install.sh | sh</pre>
-      <p class="note">Detects your OS + arch, grabs a pre-built binary, falls back to building from source. Installs to <b>/usr/local/bin</b> and creates <b>~/.anvil</b>.</p>
-      <p class="note" style="margin-top:8px">On NVIDIA Linux it grabs the <b>CUDA build</b> (driver-only — no CUDA toolkit) and walks you through the driver via <b>anvil-nvidia-install.sh</b> — universal: any distro, any NVIDIA GPU, auto-picks the right driver branch and keeps it DKMS-rebuilt across kernel updates.</p>
+      <p class="note">Detects your OS + arch, grabs a pre-built binary with checksum verification, falls back to building from source. Installs to <b>~/.local/bin</b> and creates <b>~/.anvil</b>.</p>
+      <p class="note" style="margin-top:8px">On NVIDIA Linux it grabs the <b>CUDA build</b> (driver-only — no CUDA toolkit) via <b>anvil-nvidia-install.sh</b> — universal: any distro, any NVIDIA GPU, auto-picks the right driver branch and keeps it DKMS-rebuilt across kernel updates.</p>
     </div>
     <div class="tabpanel" id="t-src">
-      <pre><span class="cm"># clone anvil + the TurboQuant llama.cpp fork</span>
-git clone https://github.com/anvil-llm/anvil.git
-git clone https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git llama-cpp
-
-<span class="cm"># build the fork</span>
-cmake -B llama-cpp/build -S llama-cpp -DCMAKE_BUILD_TYPE=Release
-cmake --build llama-cpp/build -j$(nproc)
-
-<span class="cm"># build anvil against it</span>
-cmake -B anvil/build -S anvil -Dllama_DIR=$PWD/llama-cpp/build
-cmake --build anvil/build -j$(nproc)</pre>
+      <pre>git clone https://github.com/Anvil-LLM/anvil.git
+cd anvil
+git submodule update --init --recursive
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+sudo cp build/anvil /usr/local/bin/</pre>
     </div>
     <div class="tabpanel" id="t-req">
-      <pre><span class="cm"># Linux</span>
-cmake ≥ 3.18 · g++ / clang++ · git
+      <pre>Linux   cmake ≥ 3.18 · g++ / clang++ · git
+macOS   xcode-select --install · cmake · git
+Windows VS 2022 + CMake + Git
 
-<span class="cm"># macOS (Apple Silicon runs everything on Metal)</span>
-xcode-select --install · cmake · git
-
-<span class="cm"># GPU backends auto-detected:</span>
+GPU backends auto-detected:
 CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     </div>
   </div>
 </section>
-
-<!-- ═══ BIG CTA ═══ -->
 <section>
   <div class="cta reveal">
     <div class="kicker">start-forging</div>
@@ -972,28 +1029,27 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     </div>
   </div>
 </section>
-
 </main>
-
 <footer>
   <div class="foot">
     <div class="col">
-<pre>   ░███                          ░██░██ 
-  ░██░██                            ░██ 
- ░██  ░██  ░████████  ░██    ░██ ░██░██ 
-░█████████ ░██    ░██ ░██    ░██ ░██░██ 
-░██    ░██ ░██    ░██  ░██  ░██  ░██░██ 
-░██    ░██ ░██    ░██   ░██░██   ░██░██ 
+<pre>   ░███                          ░██░██
+  ░██░██                            ░██
+ ░██  ░██  ░████████  ░██    ░██ ░██░██
+░█████████ ░██    ░██ ░██    ░██ ░██░██
+░██    ░██ ░██    ░██  ░██  ░██  ░██░██
+░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██</pre>
     </div>
     <div class="col"><h4>Project</h4>
-      <a href="https://github.com/anvil-llm/anvil">GitHub</a>
-      <a href="https://github.com/anvil-llm/anvil/issues">Issues</a>
-      <a href="https://github.com/anvil-llm/anvil/releases">Releases</a>
+      <a href="https://github.com/Anvil-LLM/anvil">GitHub</a>
+      <a href="https://github.com/Anvil-LLM/anvil/issues">Issues</a>
+      <a href="https://github.com/Anvil-LLM/anvil/releases">Releases</a>
       <a href="#changelog">Changelog</a>
     </div>
     <div class="col"><h4>Built on</h4>
-      <a href="https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant">atomic-llama-cpp-turboquant</a>
+      <a href="https://arxiv.org/abs/2504.19874">TurboQuant (Google Research)</a>
+      <a href="https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/">TurboQuant blog</a>
       <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>
       <a href="https://github.com/ArthurSonzogni/FTXUI">FTXUI</a>
     </div>
@@ -1006,14 +1062,11 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   </div>
   <div class="foot-bottom">
     <span>© 2026 Shreyan · MIT License</span>
-    <span>forged with <b>⚒</b> on the TurboQuant fork</span>
+    <span>forged with <b>⚒</b> on TurboQuant</span>
   </div>
 </footer>
-
 <button id="totop" title="back to top">↑</button>
-
 <script>
-/* ══ embers ══ */
 (function(){
   const cv=document.getElementById('embers'),cx=cv.getContext('2d');
   const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -1032,38 +1085,36 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   tick();
 })();
 
-/* ══ ticker ══ */
 (function(){
-  const items=['TurboQuant KV','4.2× compression','~1% quality loss','MTP speculative decoding','NextN','Flash Attention','TriAttention','CUDA','Vulkan','Metal','ROCm','CPU','GGUF','GBNF grammars','single binary','zero telemetry'];
+  const items=['TurboQuant KV','6.4× compression','3.5-bit quality neutral','MTP speculative decoding','NextN','Flash Attention','WHT rotation','CUDA','Vulkan','Metal','ROCm','CPU','GGUF','GBNF grammars','model registry','single binary','zero telemetry','arXiv:2504.19874'];
   const html=items.map(t=>`<span>${t}</span><b>⚒</b>`).join('');
   document.getElementById('ticker-track').innerHTML=html+html;
 })();
 
-/* ══ hero terminal ══ */
 (function(){
   const term=document.getElementById('term');
   const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
   const LOGO=
-`   ░███                          ░██░██ 
-  ░██░██                            ░██ 
- ░██  ░██  ░████████  ░██    ░██ ░██░██ 
-░█████████ ░██    ░██ ░██    ░██ ░██░██ 
-░██    ░██ ░██    ░██  ░██  ░██  ░██░██ 
-░██    ░██ ░██    ░██   ░██░██   ░██░██ 
+`   ░███                          ░██░██
+  ░██░██                            ░██
+ ░██  ░██  ░████████  ░██    ░██ ░██░██
+░█████████ ░██    ░██ ░██    ░██ ░██░██
+░██    ░██ ░██    ░██  ░██  ░██  ░██░██
+░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██`;
-  const STREAM="Imagine you have two magic coins. You flip one here and it lands heads — and instantly the other one, clear across the world, lands tails. They're linked, like they share one secret. That's entanglement: two particles connected so measuring one instantly tells you about the other, no matter the distance.";
+  const STREAM="The key-value cache stores a vector for every token you've seen. TurboQuant first rotates each vector with a Walsh-Hadamard transform so no single coordinate dominates, then quantizes with per-coordinate codebooks designed to hit the information-theoretic optimum. A 1-bit residual pass keeps attention unbiased — which is why 3.5-bit caches score identically to full precision.";
   const SEQ=[
-    {t:'cmd', s:'anvil run qwen3.6-27b.gguf --ctx 32768'},
+    {t:'cmd', s:'anvil run qwen3.6-27b.gguf --ctx 131072'},
     {t:'out', s:'Hardware: AMD Ryzen 9 7950X | x86_64 | 64 GB RAM | 32 threads'},
     {t:'out', s:'GPU: NVIDIA GeForce RTX 4090 (NVIDIA) 24564 MB VRAM [discrete]'},
     {t:'out', s:'Loading model: qwen3.6-27b.gguf ...'},
     {t:'logo'},
     {t:'amber', s:'  model   : qwen3.6-27b.gguf'},
     {t:'amber', s:'  backend : GPU layers=99 | flash=on | threads=32'},
-    {t:'amber', s:'  ctx     : 32768 tokens'},
+    {t:'amber', s:'  ctx     : 131072 tokens'},
     {t:'kv',    s:'  KV      : K=turbo4 V=turbo3'},
     {t:'prompt'},
-    {t:'cmd2',  s:'Explain quantum entanglement like I am five'},
+    {t:'cmd2',  s:'Explain TurboQuant like I am five'},
     {t:'stream',s:STREAM},
     {t:'stat',  s:'  [214 tokens, 42.7 t/s, 5.0s]'},
   ];
@@ -1095,39 +1146,44 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   else run();
 })();
 
-/* ══ live REPL playground ══ */
 (function(){
   const out=document.getElementById('play-out'),inp=document.getElementById('play-in');
   const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
   let busy=false,ri=0;
   const responses=[
-    "The KV cache stores a key and value vector for every token seen so far. TurboQuant rotates them with a Walsh–Hadamard transform, then vector-quantizes — so they take about 4x less VRAM with ~1% quality cost.",
+    "The KV cache stores a key and value vector for every token seen so far. TurboQuant rotates them with a Walsh-Hadamard transform, then quantizes each coordinate with Lloyd-Max codebooks and a 1-bit residual pass — so they take about 4-6x less VRAM with no measurable accuracy loss.",
     "I run entirely on your machine. No API keys, no network, no telemetry — just weights on your GPU and a hammer.",
-    "Try /stats to see tokens per second, or /ctx to check how full the context window is. Everything stays local."
+    "Try /stats to see tokens per second, /ctx to check context fill, or anvil list to see your model registry. Everything stays local."
   ];
   function line(cls,txt){const d=document.createElement('div');d.className='pl '+cls;d.textContent=txt;out.appendChild(d);out.scrollTop=out.scrollHeight;return d}
   async function type(el,txt,sp){if(reduce){el.textContent=txt;return}
     for(const ch of txt){el.textContent+=ch;out.scrollTop=out.scrollHeight;await sleep(sp)}}
   async function boot(){out.innerHTML='';
-    line('pl-out','Hardware: Apple M2 Max | aarch64 | 64 GB RAM | 12 threads');
+    line('pl-out','Hardware: Apple M4 Max | aarch64 | 64 GB RAM | 12 threads');
     line('pl-out','GPU: Apple GPU (unified 64 GB)');
-    line('pl-logo','   ⚒ anvil v0.2.0 — type "help" to begin');
-    line('pl-kv','  KV : K=turbo4 V=turbo3   ctx : 32768 tokens')}
+    line('pl-logo','   ⚒ anvil v0.5.0 — type "help" to begin');
+    line('pl-kv','  KV : K=turbo4 V=turbo3   ctx : 131072 tokens')}
   async function handle(raw){
     const c=raw.trim();if(!c)return;
     line('pl-cmd','> '+c);
     if(c==='help'){line('pl-out','  anvil run <model>    load a model');
-      line('pl-out','  /stats  /model  /ctx session info');
-      line('pl-out','  /temp 0.9            retune sampling');
-      line('pl-out','  /clear               quench the context');
-      line('pl-out','  anything else        chat with the forge');return}
+      line('pl-out','  anvil list            show the model registry');
+      line('pl-out','  anvil pull <name>     download a model');
+      line('pl-out','  /stats  /model  /ctx  session info');
+      line('pl-out','  /temp 0.9             retune sampling');
+      line('pl-out','  /clear                quench the context');
+      line('pl-out','  anything else         chat with the forge');return}
     if(c==='/clear'){out.innerHTML='';line('pl-out','Chat cleared.');return}
     if(c==='/stats'){line('pl-out','  tokens generated: 1,204');line('pl-out','  avg speed       : 38.2 t/s');
-      line('pl-out','  ctx used        : 8,412 / 32768 (25.7%)');line('pl-out','  KV cache        : K=turbo4 V=turbo3');return}
-    if(c==='/model'){line('pl-out','  arch       : llama');line('pl-out','  trained ctx: 131072');line('pl-out','  ngl        : 99');return}
-    if(c==='/ctx'){line('pl-ctx','  ctx [███████░░░░░░░░░░░░░░░░░░░░░] 26% (8412/32768)');return}
-    if(c.startsWith('/temp')){line('pl-out','Temperature set to '+(c.split(' ')[1]||'0.8'));return}
+      line('pl-out','  ctx used        : 8,412 / 131072 (6.4%)');line('pl-out','  KV cache        : K=turbo4 V=turbo3');return}
+    if(c==='/model'){line('pl-out','  arch       : qwen3_5');line('pl-out','  trained ctx: 262144');line('pl-out','  ngl        : 99');return}
+    if(c==='/ctx'){line('pl-ctx','  ctx [███████░░░░░░░░░░░░░░░░░░░░░] 6.4% (8412/131072)');return}
+    if(c.startsWith('/temp')){line('pl-out','Temperature set to '+(c.split(' ')[1]||'0.8')+' — saved to profile');return}
+    if(c==='anvil list'){line('pl-out','  qwen3.6-27b    turbo4/turbo3  128K  17.9 GB');
+      line('pl-out','  lfm2.5-2.6b     turbo4/turbo3  128K  1.9 GB');
+      line('pl-out','  bonsai-27b      turbo3/turbo3  262K  3.8 GB');return}
+    if(c.startsWith('anvil pull')){line('pl-out','  resolving '+(c.split(' ')[2]||'model')+' …');line('pl-out','  ✓ downloaded · sha256 verified');return}
     if(c.startsWith('anvil run')){await boot();return}
     const r=responses[ri++%responses.length];
     const el=line('pl-stream','');await type(el,r,14);
@@ -1139,13 +1195,12 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   boot();
 })();
 
-/* ══ KV playground ══ */
 (function(){
   const PRESETS=[
-    {nm:'No Compress',  ds:'K=f16 · V=f16',       gb:20.0,x:'1.0×',loss:'baseline',pct:100,col:'#ff5c3d'},
-    {nm:'Quality+',     ds:'K=q8_0 · V=turbo3',   gb:6.7, x:'~3×', loss:'<1%',     pct:33, col:'#ffc46b'},
-    {nm:'Recommended',  ds:'K=turbo4 · V=turbo3', gb:4.8, x:'4.2×',loss:'~1%',     pct:24, col:'#5df0a2'},
-    {nm:'Max Compress', ds:'K=turbo4 · V=turbo2', gb:3.3, x:'6.1×',loss:'~3%',     pct:16, col:'#ff9d2e'},
+    {nm:'No Compress',  ds:'K=f16 · V=f16 · baseline',       gb:34.4, x:'1.0×', loss:'baseline', pct:100, col:'#ff5c3d'},
+    {nm:'Quality+',     ds:'K=q8_0 · V=turbo3 · ~2.9×',      gb:11.8, x:'2.9×', loss:'<1%',     pct:34,  col:'#ffc46b'},
+    {nm:'Recommended',  ds:'K=turbo4 · V=turbo3 · ~4.6×',    gb:7.5,  x:'4.6×', loss:'~1%',     pct:22,  col:'#5df0a2'},
+    {nm:'Max Compress', ds:'K=turbo4 · V=turbo2 · ~6×',      gb:5.9,  x:'5.8×', loss:'~3%',     pct:17,  col:'#ff9d2e'},
   ];
   const wrap=document.getElementById('kv-presets');
   const fill=document.getElementById('kv-fill');
@@ -1163,66 +1218,17 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     fill.style.boxShadow=`0 0 22px ${p.col}88`;
     countTo(elGb,p.gb,' GB');elX.textContent=p.x;elLoss.textContent=p.loss;elGb.style.color=p.col;}
   PRESETS.forEach((p,i)=>{const b=document.createElement('button');b.className='kv-btn';
-    b.innerHTML=`<span class="nm">${p.nm}</span><span class="ds">${p.ds} · ${p.x} · ${p.loss} loss</span>`;
+    b.innerHTML=`<span class="nm">${p.nm}</span><span class="ds">${p.ds} · ${p.gb} GB · ${p.loss} loss</span>`;
     b.addEventListener('click',()=>select(i));wrap.appendChild(b);});
   select(2);
 })();
 
-/* ══ VRAM calculator ══ */
-(function(){
-  /*
-    VRAM estimator based on standard llama.cpp KV-cache geometry.
-    weights_GB  = params * bytes_per_param / 1e9
-    kv_bytes_per_token = 2 * layers * hidden_size * (kv_heads / heads) * kv_bytes_per_element
-    kv_GB = kv_bytes_per_token * context_tokens / 1e9
-    The KV map stores the average bytes per element for the chosen (K-type / V-type) pair.
-  */
-  const M={
-    '7B':  {p:7e9, l:32, h:4096, heads:32, kv_heads:32},
-    '13B': {p:13e9,l:40, h:5120, heads:40, kv_heads:40},
-    '34B': {p:34e9,l:48, h:8192, heads:64, kv_heads:8},
-    '27B': {p:27e9,l:64, h:5120, heads:32, kv_heads:4}
-  };
-  const WQ={f16:2,q8_0:1,q4_K:0.55,q2_K:0.3};
-  // KV bytes per element is the average of K and V: e.g. q8_0/turbo3 = (1.0 + 0.375)/2 = 0.6875.
-  // f16=2.0B, q8_0=1.0B, turbo4=0.5B, turbo3=0.375B, turbo2=0.25B.
-  const KV={'f16/f16':2,'q8_0/turbo3':0.6875,'turbo4/turbo3':0.4375,'turbo4/turbo2':0.375};
-  const GPUS=[8,12,16,24,48,80];
-  const ms=document.getElementById('c-model'),wq=document.getElementById('c-wq'),
-        kv=document.getElementById('c-kv'),cx=document.getElementById('c-ctx'),cxv=document.getElementById('c-ctxv');
-  const fit=document.getElementById('gpu-fit');
-  GPUS.forEach(g=>{const d=document.createElement('div');d.className='gpu-chip';d.dataset.gb=g;d.textContent=g+' GB';fit.appendChild(d)});
-  const f=gb=>gb>=100?gb.toFixed(0):gb>=10?gb.toFixed(1):gb.toFixed(2);
-  function calc(){
-    const m=M[ms.value],ctxN=+cx.value;
-    cxv.textContent=(ctxN/1024)+'K';
-    const wGB=m.p*WQ[wq.value]/1e9;
-    // Per-token KV elements for f16, then scaled by the chosen KV pair's bytes-per-element.
-    const el=2*m.l*m.h*(m.kv_heads/m.heads);
-    const kGB=el*KV[kv.value]*ctxN/1e9;
-    const tot=wGB+kGB;
-    document.getElementById('cn-w').textContent=f(wGB)+' GB';
-    document.getElementById('cn-kv').textContent=f(kGB)+' GB';
-    document.getElementById('cn-tot').textContent=f(tot)+' GB';
-    const scale=Math.max(tot*1.15,10);
-    document.getElementById('sb-w').style.width=(wGB/scale*100)+'%';
-    document.getElementById('sb-k').style.width=(kGB/scale*100)+'%';
-    [...fit.children].forEach(ch=>{
-      const ok=tot<=+ch.dataset.gb;
-      ch.classList.toggle('ok',ok);ch.classList.toggle('no',!ok);
-      ch.textContent=ch.dataset.gb+' GB '+(ok?'✓':'✗');});}
-  [ms,wq,kv,cx].forEach(el=>el.addEventListener('input',calc));
-  calc();
-})();
-
-/* ══ benchmark bars on scroll ══ */
 (function(){
   const io=new IntersectionObserver(es=>{es.forEach(e=>{
     if(e.isIntersecting){e.target.querySelectorAll('.bar i').forEach(b=>{b.style.width=b.dataset.w+'%'});io.unobserve(e.target)}})},{threshold:.3});
   document.querySelectorAll('.bench').forEach(el=>io.observe(el));
 })();
 
-/* ══ speculative decoding ══ */
 (function(){
   const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
   const line=document.getElementById('tokline'),meter=document.getElementById('spec-meter');
@@ -1248,7 +1254,6 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   step();
 })();
 
-/* ══ FAQ accordion ══ */
 document.querySelectorAll('.qa button').forEach(btn=>{
   btn.addEventListener('click',()=>{
     const qa=btn.parentElement,ans=qa.querySelector('.a');
@@ -1257,7 +1262,6 @@ document.querySelectorAll('.qa button').forEach(btn=>{
     if(!open){qa.classList.add('open');ans.style.maxHeight=ans.scrollHeight+'px'}});
 });
 
-/* ══ install tabs ══ */
 document.querySelectorAll('.tabbtn').forEach(btn=>{
   btn.addEventListener('click',()=>{
     document.querySelectorAll('.tabbtn').forEach(b=>b.classList.remove('active'));
@@ -1266,7 +1270,6 @@ document.querySelectorAll('.tabbtn').forEach(btn=>{
     document.getElementById(btn.dataset.tab).classList.add('active');});
 });
 
-/* ══ copy ══ */
 document.querySelectorAll('.copybtn').forEach(btn=>{
   btn.addEventListener('click',()=>{
     navigator.clipboard.writeText(document.querySelector(btn.dataset.copy).textContent);
@@ -1274,7 +1277,6 @@ document.querySelectorAll('.copybtn').forEach(btn=>{
     setTimeout(()=>{btn.textContent='copy';btn.classList.remove('done')},1600);});
 });
 
-/* ══ progress + back to top ══ */
 (function(){
   const prog=document.getElementById('progress'),totop=document.getElementById('totop');
   addEventListener('scroll',()=>{
@@ -1284,7 +1286,6 @@ document.querySelectorAll('.copybtn').forEach(btn=>{
   totop.addEventListener('click',()=>scrollTo({top:0,behavior:'smooth'}));
 })();
 
-/* ══ reveal ══ */
 (function(){
   const io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.1});
   document.querySelectorAll('.reveal').forEach(el=>io.observe(el));

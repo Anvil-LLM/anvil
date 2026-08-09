@@ -1,29 +1,4 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-#  colab-nvidia-test.sh — test anvil-nvidia-install.sh on Google Colab
-#
-#  Colab gives a real Ubuntu VM with a real NVIDIA GPU (free tier: T4/Turing),
-#  already running the NVIDIA driver. That makes it perfect for testing the
-#  installer's detection, branch resolution, toolchain and download paths for
-#  real — but NOT the final module swap (Colab's driver is already loaded and
-#  you cannot reboot a session).
-#
-#  What this tests (safe, non-destructive):
-#    1. --check on real hardware (distro + GPU + generation classification)
-#    2. --dry-run full plan preview
-#    3. Branch consistency: resolved driver major matches detected generation
-#    4. Real toolchain install (kernel headers + dkms + build tools)
-#    5. Real .run download + validity check (sh installer.run --version)
-#
-#  What it does NOT run (unless you pass --install): the actual driver swap.
-#  On Colab that will conflict with the loaded driver and likely break the
-#  GPU for the rest of the session (no reboot). Test that on a real machine.
-#
-#  Usage in a Colab cell:
-#    !bash <(curl -fsSL https://raw.githubusercontent.com/gondaliyashreyan1/Anvil/main/tests/colab-nvidia-test.sh)
-#  Destructive variant (breaks the session GPU — last cell before giving up):
-#    !bash <(curl -fsSL https://raw.githubusercontent.com/gondaliyashreyan1/Anvil/main/tests/colab-nvidia-test.sh) --install
-# ─────────────────────────────────────────────────────────────────────────────
 
 REPO="gondaliyashreyan1/Anvil"
 BRANCH="main"
@@ -34,7 +9,7 @@ PASS=0
 FAIL=0
 WARN=0
 
-report() { # pass|fail|warn desc
+report() {
     case "$1" in
         pass) echo "  [PASS] $2"; PASS=$((PASS + 1)) ;;
         fail) echo "  [FAIL] $2"; FAIL=$((FAIL + 1)) ;;
@@ -46,7 +21,6 @@ echo "== anvil-nvidia-install Colab test =="
 echo "== repo: ${REPO}@${BRANCH}"
 echo ""
 
-# 0. Fetch the installer -----------------------------------------------------
 echo "── 0. Fetch installer"
 cd /tmp || exit 1
 if curl -fsSL "$INSTALLER_URL" -o anvil-nvidia-install.sh; then
@@ -58,7 +32,6 @@ else
     exit 1
 fi
 
-# 1. --check on real hardware ------------------------------------------------
 echo ""
 echo "── 1. Installer --check (real hardware)"
 CHECK_OUT=$(./anvil-nvidia-install.sh --check 2>&1)
@@ -71,7 +44,6 @@ echo "$CHECK_OUT" | grep -q "Distro        :" && report pass "distro detected" |
 GEN=$(echo "$CHECK_OUT" | sed -n 's/.*GPU generation: \([a-z]*\).*/\1/p')
 echo "  → detected generation: ${GEN:-unknown}"
 
-# 2. --dry-run ---------------------------------------------------------------
 echo ""
 echo "── 2. Installer --dry-run (full plan preview)"
 DRY_OUT=$(./anvil-nvidia-install.sh --dry-run 2>&1)
@@ -84,7 +56,6 @@ else
     report fail "no driver version in dry-run (network blocked?)"
 fi
 
-# 3. Branch consistency ------------------------------------------------------
 echo ""
 echo "── 3. Branch consistency (generation -> driver major)"
 MAJOR=$(printf '%s' "$INSTALL_VER" | cut -d. -f1)
@@ -107,7 +78,6 @@ case "$GEN" in
         ;;
 esac
 
-# 4. Real toolchain install --------------------------------------------------
 echo ""
 echo "── 4. Toolchain install (real, non-destructive)"
 echo "  Running apt-get update + linux-headers + dkms + build-essential..."
@@ -132,7 +102,6 @@ has_cmd gcc && report pass "gcc present" || report fail "gcc missing"
 has_cmd dkms && report pass "dkms present" || report fail "dkms missing"
 [ -d "/usr/src/linux-headers-$(uname -r)" ] || [ -d "/usr/lib/modules/$(uname -r)/build" ] && report pass "kernel headers present" || report warn "kernel headers not found for $(uname -r)"
 
-# 5. Real .run download + validity -------------------------------------------
 echo ""
 echo "── 5. Real driver .run download + validity"
 if [ -n "$INSTALL_VER" ]; then
@@ -155,7 +124,6 @@ if [ -n "$INSTALL_VER" ]; then
     fi
 fi
 
-# 6. Optional destructive real install ---------------------------------------
 if [ "$1" = "--install" ]; then
     echo ""
     echo "── 6. REAL INSTALL (destructive on Colab — driver swap, no reboot)"

@@ -28,9 +28,7 @@ jobs:
             asset: anvil-macos-aarch64
             binary: build/anvil
             os: macos-latest
-            # Pin the deployment target: without it the build inherits the
-            # runner SDK's minos (e.g. 26.0), so the binary refuses to run on
-            # macOS <= 15 ("does not run on this system"). 13.0 = Ventura.
+
             flags: "-DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_SYCL=OFF -DGGML_OPENVINO=OFF -DGGML_OPENCL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0"
           - name: windows-x86_64
             asset: anvil-windows-x86_64.exe
@@ -49,34 +47,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Pinned release, NOT the 'latest' pointer: LunarG rotates the blob
-          # behind 'latest' and served an expired Azure blob (BlobNotFound),
-          # which hung this step for ~30 minutes on every prior run. A pinned
-          # version + hard timeouts fail fast instead of hanging.
+
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           $version = '1.3.290.0'
           $installer = "$env:TEMP\vulkan-sdk-$version.exe"
           Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe" `
             -OutFile $installer -TimeoutSec 600
-          # The Vulkan SDK installer is Qt-based, NOT Inno Setup: '/S' is not a
-          # valid flag (it exits 1). The supported CLI (same as the
-          # jakoch/install-vulkan-sdk action) is:
-          #   --root <dir> --accept-licenses --default-answer --confirm-command install
+
           $dest = "C:\VulkanSDK\$version"
           $p = Start-Process -FilePath $installer `
             -ArgumentList @('--root', $dest, '--accept-licenses', '--default-answer', '--confirm-command', 'install') `
             -NoNewWindow -PassThru
-          # WaitForExit (a .NET method, unlike Start-Process -TimeoutSec which
-          # only exists in PowerShell 7.4+) gives a hard 15-min bound so a
-          # wedged installer cannot hang the job.
+
           if (-not $p.WaitForExit(900000)) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             throw 'Vulkan SDK installer timed out after 15 minutes'
           }
           if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($p.ExitCode)" }
-          # Point VULKAN_SDK at the versioned install dir — ggml's
-          # find_package(Vulkan) uses it as a prefix path.
+
           if (-not (Test-Path "$dest\Bin\glslc.exe")) {
             throw "Vulkan SDK $version not found at $dest after install"
           }
@@ -85,10 +74,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The Vulkan SDK ships spirv.hpp but not SPIRV-HeadersConfig.cmake,
-          # which ggml's find_package(SPIRV-Headers CONFIG REQUIRED) needs.
-          # vcpkg (preinstalled at C:\vcpkg on windows-latest) provides the
-          # CMake config; the Configure step points SPIRV-Headers_DIR at it.
+
           & C:\vcpkg\vcpkg.exe install spirv-headers:x64-windows
           if ($LASTEXITCODE -ne 0) { throw "vcpkg spirv-headers install failed (exit $LASTEXITCODE)" }
       - name: Configure

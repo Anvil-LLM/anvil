@@ -1,5 +1,3 @@
-// anvil — single-binary local LLM runtime (llama-turbo backend: TurboQuant + MTP + NextN).
-// Merged monolith — source history preserved in the modular commit (392c155).
 
 #include "llama.h"
 #include "ggml.h"
@@ -27,15 +25,14 @@
 #include <sys/sysctl.h>
 #endif
 #ifdef _WIN32
-#include <io.h>          // _isatty, _fileno (POSIX unistd.h does not exist on MSVC)
+#include <io.h>
 #else
-#include <unistd.h>      // isatty, STDIN_FILENO (POSIX)
-#include <sys/ioctl.h>   // TIOCGWINSZ (live-render cursor math)
-#include <glob.h>        // sysfs GPU probe (Linux only, harmless elsewhere)
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <glob.h>
 #endif
 #ifdef _WIN32
-// Must precede <windows.h>: it defines min/max macros that break FTXUI and
-// the standard library (FTXUI #errors on this), and bloats compile time.
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -55,32 +52,22 @@
 #include <map>
 #include <nlohmann/json.hpp>
 
-// ──── src/common.hpp ────
-
-
-
-// ─── Version & branding ────────────────────────────────────────────────────
-
 inline const char * ANVIL_LOGO = R"(
-   ░███                          ░██░██ 
-  ░██░██                            ░██ 
- ░██  ░██  ░████████  ░██    ░██ ░██░██ 
-░█████████ ░██    ░██ ░██    ░██ ░██░██ 
-░██    ░██ ░██    ░██  ░██  ░██  ░██░██ 
-░██    ░██ ░██    ░██   ░██░██   ░██░██ 
+   ░███                          ░██░██
+  ░██░██                            ░██
+ ░██  ░██  ░████████  ░██    ░██ ░██░██
+░█████████ ░██    ░██ ░██    ░██ ░██░██
+░██    ░██ ░██    ░██  ░██  ░██  ░██░██
+░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.5.0";
+inline const char * ANVIL_VERSION = "0.5.1";
 inline const int    CONFIG_VERSION = 2;
-
-// ─── Global state ──────────────────────────────────────────────────────────
 
 inline std::atomic<bool> g_interrupted{false};
 inline void anvil_signal_handler(int) {
     g_interrupted.store(true, std::memory_order_relaxed);
 }
-
-// ─── RAII wrappers around llama objects ────────────────────────────────────
 
 struct LlamaModel {
     llama_model * p = nullptr;
@@ -125,7 +112,7 @@ struct LlamaSampler {
         if (this != &o) { if (p) llama_sampler_free(p); p = o.p; o.p = nullptr; }
         return *this;
     }
-    // Replace the owned sampler (frees the old one, if any).
+
     void reset(llama_sampler * p_) {
         if (p_ != p) { if (p) llama_sampler_free(p); p = p_; }
     }
@@ -138,10 +125,6 @@ struct LlamaBackend {
     LlamaBackend() { llama_backend_init(); }
     ~LlamaBackend() { llama_backend_free(); }
 };
-
-// ─── Safe number parsing ───────────────────────────────────────────────────
-// Full-string validation: rejects trailing garbage, ERANGE, and NaN/Inf.
-// These replace the previous stoi/stof helpers which silently truncated.
 
 inline bool parse_int(const std::string & s, int & out) {
     if (s.empty()) return false;
@@ -175,8 +158,6 @@ inline bool parse_uint64(const std::string & s, uint64_t & out) {
     return true;
 }
 
-// ─── KV cache type options ─────────────────────────────────────────────────
-
 struct KVTypeOption {
     const char * label;
     ggml_type    type;
@@ -209,8 +190,6 @@ inline const KVPreset KV_PRESETS[] = {
 
 inline constexpr int KV_PRESETS_COUNT = static_cast<int>(sizeof(KV_PRESETS) / sizeof(KV_PRESETS[0]));
 
-// ─── Hardware info ─────────────────────────────────────────────────────────
-
 struct GPUInfo {
     std::string name;
     std::string vendor;
@@ -228,8 +207,6 @@ struct HWInfo {
     bool        apple_silicon = false;
 };
 
-// ─── Config ────────────────────────────────────────────────────────────────
-
 struct AnvilConfig {
     int       version    = CONFIG_VERSION;
     int       ngl        = -1;
@@ -244,7 +221,7 @@ struct AnvilConfig {
     ggml_type type_k     = GGML_TYPE_Q8_0;
     ggml_type type_v     = GGML_TYPE_TURBO3_0;
     std::string model;
-    std::string system_prompt;   // per-run system prompt (from CLI or profile)
+    std::string system_prompt;
 };
 
 inline std::string config_dir() {
@@ -264,10 +241,6 @@ inline std::string sessions_dir() {
     return config_dir() + "/sessions";
 }
 
-// ─── Text helpers ──────────────────────────────────────────────────────────
-
-// Buffers partial UTF-8 sequences so multi-byte characters split across
-// token pieces are never printed half-rendered.
 struct Utf8Buffer {
     std::string pending;
 
@@ -297,48 +270,25 @@ struct Utf8Buffer {
     }
 };
 
-// ─── Streaming markdown renderer ──────────────────────────────────────────
-// Model output is styled by the vendored mdtty library (markdown → ANSI):
-// bold/italic/code, fences, headings, quotes, lists, HRs, GFM tables.
-//
-// TTY: a *live redraw* — the full response-so-far is re-rendered through
-// mdtty's one-shot render() every ~35ms and rewritten in place via ANSI
-// cursor math, so tokens appear continuously and formatting pops in the
-// instant a construct completes. If the response outgrows the screen the
-// redraw is abandoned and the same text streams through the stateful
-// renderer instead (no torn output either way).
-//
-// Piped (non-TTY): mdtty's line-buffered streaming renderer emits clean
-// output per completed line, so `-p | head` and log files still stream.
-//
-// Thinking blocks (<thinking>…, 〈think〉…, variants) are split out here (tag
-// detection only — the formatting is mdtty's) and rendered with a dim
-// palette, so reasoning is formatted too, just lighter.
-//
-// Display-only: the caller still stores the raw text (markers and all) in
-// history. A trailing incomplete tag ("<thin" + …) is held back so it never
-// flashes as response text.
 struct MarkdownStream {
-    mdtty::Config resp_cfg;         // response palette: mdtty defaults
-    mdtty::Config think_cfg;        // thinking palette: same colors, dimmed block
-    // Stateful streaming renderers (piped output / tall-response fallback).
-    // mdtty auto-strips ANSI when stdout is not a TTY, so piped stays clean.
+    mdtty::Config resp_cfg;
+    mdtty::Config think_cfg;
+
     mdtty::Renderer resp_s;
     mdtty::Renderer think_s;
 
-    std::string raw;                // live-redraw accumulation (TTY only)
-    std::string pending;            // streaming accumulation (piped / fallback)
-    std::string last_render;        // previous rendered frame (cursor math)
-    size_t rendered_up_to = 0;      // bytes of `raw` already shown (live)
-    bool color = false;             // TTY check, same one mdtty uses internally
-    bool in_think_s = false;        // thinking state for the streaming path
-    bool first = true;              // live: first frame has nothing to erase
-    bool live = true;               // live: redraw-in-place still active
+    std::string raw;
+    std::string pending;
+    std::string last_render;
+    size_t rendered_up_to = 0;
+    bool color = false;
+    bool in_think_s = false;
+    bool first = true;
+    bool live = true;
     std::chrono::steady_clock::time_point last_draw;
 
     static constexpr std::chrono::milliseconds DRAW_MS{35};
-    // Banner/prompt rows above the response: redraw only while the response
-    // (plus that margin) fits on screen, so \033[nA can never clamp/scroll.
+
     static constexpr int SCREEN_MARGIN = 8;
 
     static void sink_out(std::string_view s) {
@@ -350,16 +300,12 @@ struct MarkdownStream {
         : resp_s(sink_out, {}), think_s(sink_out, think_config()),
           color(mdtty::Renderer::is_tty()) {}
 
-    // Thinking palette: keep mdtty's full colors so bold/code/headings stay
-    // visibly formatted, but dim the whole block ("lighter, greyish").
-    // The reset code carries the dim so every span stays in the dim family.
     static mdtty::Config think_config() {
         mdtty::Config tc;
-        tc.reset = "\033[0;2m";     // reset + dim: block-wide lighter tone
+        tc.reset = "\033[0;2m";
         return tc;
     }
 
-    // ── thinking-tag detection (formatter-agnostic) ──
     static bool tag_at(const std::string & t, size_t i, bool closing, size_t & len) {
         static const char * open_[]  = { "<thinking>", "<think>", "〈thinking〉", "〈think〉" };
         static const char * close_[] = { "</thinking>", "</think>", "〈/thinking〉", "〈/think〉" };
@@ -386,9 +332,8 @@ struct MarkdownStream {
         return false;
     }
 
-    // Longest suffix of buf that could still extend into a thinking tag.
     static size_t partial_suffix(const std::string & b) {
-        static constexpr size_t HOLD_MAX = 15;   // longest tag: "〈/thinking〉"
+        static constexpr size_t HOLD_MAX = 15;
         const size_t lim = std::min(b.size(), HOLD_MAX);
         for (size_t L = lim; L >= 1; --L) {
             if (is_tag_prefix(b.substr(b.size() - L))) return L;
@@ -396,7 +341,6 @@ struct MarkdownStream {
         return 0;
     }
 
-    // Split `doc` into response/thinking segments and render each through mdtty.
     std::string render_all(const std::string & doc) {
         std::string out, seg;
         bool in_think = false;
@@ -414,12 +358,12 @@ struct MarkdownStream {
         size_t i = 0;
         while (i < doc.size()) {
             size_t len = 0;
-            if (tag_at(doc, i, true, len)) {           // closing tag
+            if (tag_at(doc, i, true, len)) {
                 if (in_think) { flush_seg(); in_think = false; i += len; continue; }
-                i += len;                              // stray close: swallow
+                i += len;
                 continue;
             }
-            if (!in_think && tag_at(doc, i, false, len)) {   // opening tag
+            if (!in_think && tag_at(doc, i, false, len)) {
                 flush_seg();
                 in_think = true;
                 i += len;
@@ -431,7 +375,6 @@ struct MarkdownStream {
         return out;
     }
 
-    // ── terminal plumbing for the in-place redraw ──
     static int terminal_cols() {
 #if defined(_WIN32)
         CONSOLE_SCREEN_BUFFER_INFO csbi{};
@@ -464,23 +407,20 @@ struct MarkdownStream {
         return 24;
     }
 
-    // Display cell width of one UTF-8 code point (cursor math only — mdtty
-    // does the actual formatting; this just counts rows to erase).
     static int cell_width(uint32_t cp) {
         if (cp < 0x80u) return 1;
         if (cp == 0u) return 0;
         if ((cp >= 0x0300u && cp <= 0x036Fu) || (cp >= 0x1AB0u && cp <= 0x1AFFu) ||
             (cp >= 0x1DC0u && cp <= 0x1DFFu) || (cp >= 0x20D0u && cp <= 0x20FFu) ||
-            (cp >= 0xFE20u && cp <= 0xFE2Fu)) return 0;           // combining
+            (cp >= 0xFE20u && cp <= 0xFE2Fu)) return 0;
         if ((cp >= 0x1100u && cp <= 0x115Fu) || (cp >= 0x2E80u && cp <= 0xA4CFu) ||
             (cp >= 0xAC00u && cp <= 0xD7A3u) || (cp >= 0xF900u && cp <= 0xFAFFu) ||
             (cp >= 0xFE30u && cp <= 0xFE4Fu) || (cp >= 0xFF00u && cp <= 0xFF60u) ||
             (cp >= 0xFFE0u && cp <= 0xFFE6u) || (cp >= 0x1F300u && cp <= 0x1FAFFu) ||
-            (cp >= 0x20000u && cp <= 0x3FFFDu)) return 2;          // CJK / emoji
+            (cp >= 0x20000u && cp <= 0x3FFFDu)) return 2;
         return 1;
     }
 
-    // Number of terminal rows the rendered string occupies (ANSI stripped).
     static int count_rows(const std::string & rendered) {
         const int cols = terminal_cols();
         int rows = 0;
@@ -524,20 +464,19 @@ struct MarkdownStream {
     }
 
     void draw() {
-        // Hold back a trailing incomplete thinking tag so "<thin" etc. never
-        // flash as response text; the suffix stays in `raw` for the next draw.
+
         const size_t hold = partial_suffix(raw);
         const std::string view = raw.substr(0, raw.size() - hold);
         const std::string rendered = render_all(view);
         const int old_rows = count_rows(last_render);
         if (old_rows >= terminal_rows() - SCREEN_MARGIN) {
-            live = false;                    // too tall to redraw in place
-            pending = raw.substr(rendered_up_to);   // only the unseen tail
+            live = false;
+            pending = raw.substr(rendered_up_to);
             return;
         }
         if (live && !first && old_rows > 0) {
-            printf("\033[%dA", old_rows);    // up to the response start
-            printf("\033[J");                // erase everything below it
+            printf("\033[%dA", old_rows);
+            printf("\033[J");
         }
         fputs(rendered.c_str(), stdout);
         fflush(stdout);
@@ -546,8 +485,6 @@ struct MarkdownStream {
         rendered_up_to = view.size();
     }
 
-    // Streaming path: mdtty line-buffers per line, emitting clean formatted
-    // text as lines complete. Handles thinking-tag routing + holdback.
     void drain_s(bool force = false) {
         while (!pending.empty()) {
             size_t tag_i = std::string::npos;
@@ -581,14 +518,14 @@ struct MarkdownStream {
             }
             const size_t hold = force ? 0 : partial_suffix(pending);
             const size_t emit = pending.size() - hold;
-            if (emit == 0) break;            // only a partial tag pending
+            if (emit == 0) break;
             (in_think_s ? think_s : resp_s).feed(pending.substr(0, emit));
             pending.erase(0, emit);
         }
     }
 
     void feed(const std::string & s) {
-        if (!color || !live) {               // piped, or tall-response fallback
+        if (!color || !live) {
             pending += s;
             drain_s(false);
             return;
@@ -603,7 +540,7 @@ struct MarkdownStream {
 
     void flush() {
         if (color && live) {
-            draw();                          // final live frame (full raw)
+            draw();
         } else {
             drain_s(true);
             (in_think_s ? think_s : resp_s).flush();
@@ -612,7 +549,7 @@ struct MarkdownStream {
                 in_think_s = false;
             }
         }
-        resp_s.reset();                      // ready for the next response
+        resp_s.reset();
         think_s.reset();
         raw.clear();
         pending.clear();
@@ -637,7 +574,6 @@ struct GenStats {
     }
 };
 
-// Portable TTY check: isatty(STDIN_FILENO) is POSIX; MSVC uses _isatty/_fileno.
 inline bool stdin_is_tty() {
 #ifdef _WIN32
     return _isatty(_fileno(stdin)) != 0;
@@ -645,26 +581,23 @@ inline bool stdin_is_tty() {
     return isatty(STDIN_FILENO) != 0;
 #endif
 }
-// ──── src/cli.hpp ────
-
-
 
 struct CliArgs {
-    std::string sub;                    // "run" (default) | models | profile | rm | pull
-    std::vector<std::string> sub_args;  // raw args for subcommands
+    std::string sub;
+    std::vector<std::string> sub_args;
     std::string model;
-    std::string friendly;               // registry display name, when resolved
+    std::string friendly;
     int         n_ctx       = 0;
     int         ngl         = -1;
     int         n_threads   = 0;
     float       temp        = -1.0f;
-    int         top_k       = -1;   // -1 = not set
+    int         top_k       = -1;
     float       top_p       = -1.0f;
     float       repeat_penalty = -1.0f;
     bool        flash_attn  = false;
     bool        no_flash_attn = false;
     bool        mtp         = false;
-    bool        save_profile = false;   // persist CLI overrides into the model profile
+    bool        save_profile = false;
     bool        help        = false;
     bool        invalid     = false;
     bool        version     = false;
@@ -677,10 +610,6 @@ struct CliArgs {
     int         max_tokens  = -1;
 };
 
-// Bounds applied to CLI numeric options (also used by config validation).
-// Context has NO artificial cap: the only ceiling is the backend's position
-// type (llama_pos is int32_t), so INT32_MAX is the real limit. Memory is the
-// practical constraint and allocation fails naturally if a ctx is too big.
 inline constexpr int   MAX_CTX      = INT32_MAX;
 inline constexpr int   MAX_THREADS  = 1024;
 inline constexpr float MAX_TEMP     = 5.0f;
@@ -688,8 +617,6 @@ inline constexpr int   MAX_TOP_K    = 100000;
 
 void print_usage();
 CliArgs parse_args(int argc, char ** argv);
-// ──── src/cli.cpp ────
-
 
 void print_usage() {
     printf("anvil %s — Forge anything.\n\n", ANVIL_VERSION);
@@ -740,8 +667,6 @@ void print_usage() {
     printf("  anvil run model.gguf --grammar json.gbnf -p \"List 3 colors\"\n");
 }
 
-// Parse an integer option with full-string validation and range checking.
-// On failure prints an error, marks the args invalid and returns false.
 static bool set_int(const std::string & arg_name, const std::string & value,
                     int min, int max, int & out, CliArgs & a) {
     int v = 0;
@@ -772,10 +697,9 @@ static bool set_float(const std::string & arg_name, const std::string & value,
 
 CliArgs parse_args(int argc, char ** argv) {
     CliArgs a;
-    // Bare invocation (no args) is a usage error (exit 1); an explicit --help
-    // still exits 0. Standard CLI convention (git, docker, clang, ...).
+
     if (argc < 2) { a.invalid = true; a.help = true; return a; }
-    // Subcommands keep their raw arguments for the dispatcher in main().
+
     const std::string first = argv[1];
     if (first == "models" || first == "profile" || first == "rm" || first == "pull") {
         a.sub = first;
@@ -793,7 +717,7 @@ CliArgs parse_args(int argc, char ** argv) {
             set_int(arg, argv[++i], 1, MAX_CTX, a.n_ctx, a);
         }
         else if ((arg == "-ngl" || arg == "--ngl" || arg == "--n-gpu-layers") && i + 1 < argc) {
-            // -1 = auto/all, so allow -1
+
             set_int(arg, argv[++i], -1, 10000, a.ngl, a);
         }
         else if ((arg == "-t" || arg == "--temp") && i + 1 < argc) {
@@ -832,8 +756,6 @@ CliArgs parse_args(int argc, char ** argv) {
     }
     return a;
 }
-// ──── src/config.hpp ────
-
 
 ggml_type kv_type_from_name(const std::string & name);
 const char * kv_type_short(ggml_type type);
@@ -841,8 +763,6 @@ const char * kv_type_short(ggml_type type);
 void write_config(const AnvilConfig & cfg);
 AnvilConfig load_config();
 bool config_exists();
-// ──── src/config.cpp ────
-
 
 ggml_type kv_type_from_name(const std::string & name) {
     for (int i = 0; i < KV_OPTIONS_COUNT; i++) {
@@ -858,10 +778,6 @@ const char * kv_type_short(ggml_type type) {
     }
     return "f16";
 }
-
-// ─── Minimal JSON string getter ────────────────────────────────────────────
-// Extracts the string/number value of a top-level key. Intentionally small and
-// dependency-free; the config schema is flat and controlled by us.
 
 static std::string json_get(const std::string & json, const std::string & key) {
     const std::string search = "\"" + key + "\"";
@@ -922,8 +838,6 @@ static std::string json_get(const std::string & json, const std::string & key) {
     return val;
 }
 
-// ─── Config file I/O ───────────────────────────────────────────────────────
-
 static std::string json_escape(const std::string & s) {
     std::string r;
     for (const char c : s) {
@@ -976,7 +890,7 @@ void write_config(const AnvilConfig & cfg) {
             return;
         }
     }
-    // Atomic replace: a crash mid-write never corrupts the real config.
+
     fs::rename(tmp, config_path(), ec);
     if (ec) {
         fprintf(stderr, "\033[33mwarning: could not rename config into place at %s: %s\033[0m\n",
@@ -1026,7 +940,6 @@ AnvilConfig load_config() {
     s = json_get(json, "model");
     if (!s.empty()) cfg.model = s;
 
-    // v1 -> v2 migration: honor the old "no_turbo" key.
     if (cfg.version < 2) {
         const std::string no_turbo = json_get(json, "no_turbo");
         if (no_turbo == "true") {
@@ -1046,20 +959,14 @@ bool config_exists() {
     return f.good();
 }
 
-// ──── src/models.hpp ────
-// Friendly-name model registry (~/.anvil/models.json) with persistent
-// per-model profiles. Zero new dependencies: nlohmann/json is vendored in
-// the backend; writes are atomic (tmp + rename), matching config.json.
-
 inline std::string models_json_path() { return config_dir() + "/models.json"; }
 inline std::string models_dir()       { return config_dir() + "/models"; }
 
-// Declared here (defined in hardware.cpp below) because import validates GGUF.
 bool validate_gguf(const std::string & path);
 std::string gguf_check_error(const std::string & path);
 
 struct ModelProfile {
-    // Explicitly-set keys only; anything absent inherits the global config.
+
     std::map<std::string, nlohmann::json> settings;
 
     nlohmann::json to_json() const { return nlohmann::json(settings); }
@@ -1077,9 +984,6 @@ struct ModelProfile {
     void set(const std::string & k, const nlohmann::json & v) { settings[k] = v; }
     bool unset(const std::string & k) { return settings.erase(k) > 0; }
 
-    // Apply explicitly-set values onto a config; returns the number applied.
-    // Tolerant of hand-edited JSON: a wrong-typed value warns and is skipped
-    // rather than crashing the run (nlohmann throws json::type_error).
     int apply_to(AnvilConfig & cfg) const {
         int n = 0;
         for (const auto & [k, v] : settings) {
@@ -1116,18 +1020,18 @@ struct ModelProfile {
 struct ModelEntry {
     std::string name;
     std::string path;
-    std::string source = "local";   // local | ollama | ollama-local | hf
-    std::string source_id;          // e.g. library/llama3.2:3b or HF repo[:file]
+    std::string source = "local";
+    std::string source_id;
     uint64_t    size_bytes = 0;
     std::string added;
-    std::string desc;               // GGUF architecture description
+    std::string desc;
     int64_t     trained_ctx = 0;
-    std::string chat_template;      // from Ollama metadata layers (if any)
+    std::string chat_template;
     std::string license;
-    std::string params_json;        // raw Ollama params blob (if any)
-    nlohmann::json gguf_meta;       // verbose GGUF header metadata
+    std::string params_json;
+    nlohmann::json gguf_meta;
     ModelProfile profile;
-    bool         seeded = false;    // per-model schema already populated once
+    bool         seeded = false;
 
     nlohmann::json to_json() const {
         return {
@@ -1159,12 +1063,6 @@ struct ModelEntry {
     }
 };
 
-// Every model carries its own individual settings schema, derived from the
-// model's own GGUF header (trained context + converter-recorded sampling
-// params) plus Anvil's recommended stack (TurboQuant KV compression, flash
-// attention). Only fills keys the user hasn't explicitly set, so the setup
-// TUI and `anvil profile <name> set k=v` always win. Returns true when any
-// key was added (used to backfill pre-existing registry entries).
 static bool seed_model_profile(ModelProfile & p, int64_t trained_ctx,
                                const nlohmann::json & gguf_meta) {
     bool changed = false;
@@ -1174,14 +1072,10 @@ static bool seed_model_profile(ModelProfile & p, int64_t trained_ctx,
         changed = true;
     };
 
-    // Full trained context by default. TurboQuant KV compression is what
-    // makes that feasible (e.g. Bonsai-27B @ 262k ctx ≈ 4 GB KV), so we do
-    // not shrink n_ctx to dodge memory — only the absolute sanity cap applies.
     if (trained_ctx > 0) {
         fill("n_ctx", static_cast<int>(std::min<int64_t>(trained_ctx, MAX_CTX)));
     }
 
-    // Model-authored sampling params, when the converter recorded them.
     auto sval = [&](const char * key) -> std::string {
         const std::string full = std::string("general.sampling.") + key;
         if (gguf_meta.is_object() && gguf_meta.contains(full) && gguf_meta[full].is_string()) {
@@ -1200,14 +1094,11 @@ static bool seed_model_profile(ModelProfile & p, int64_t trained_ctx,
     if (!s_top_p.empty()  && parse_float(s_top_p, fv) && fv > 0.0f && fv <= 1.0f)     fill("top_p", fv);
     if (!s_repeat.empty() && parse_float(s_repeat, fv) && fv >= 1.0f && fv <= 100.0f) fill("repeat_penalty", fv);
 
-    // Anvil's recommended stack (same as the setup TUI defaults).
     fill("flash_attn", true);
     fill("type_k", std::string("turbo4"));
     fill("type_v", std::string("turbo3"));
     return changed;
 }
-
-// ──── src/models.cpp ────
 
 static std::string now_iso() {
     const auto now = std::chrono::system_clock::now();
@@ -1236,7 +1127,6 @@ static std::string format_size(uint64_t bytes) {
     return buf;
 }
 
-// Safe filename from a friendly name (ollama:llama3.2:3b -> llama3.2-3b).
 static std::string slugify(const std::string & s) {
     std::string out;
     for (const char ch : s) {
@@ -1264,18 +1154,14 @@ std::vector<ModelEntry> load_models() {
         if (root.contains("models") && root["models"].is_array()) {
             for (const auto & j : root["models"]) {
                 try { models.push_back(ModelEntry::from_json(j)); }
-                catch (const nlohmann::json::exception &) { /* skip malformed entry */ }
+                catch (const nlohmann::json::exception &) {  }
             }
         }
     } catch (const nlohmann::json::exception & e) {
         fprintf(stderr, "\033[33mwarning: %s is unreadable (%s); starting empty\033[0m\n",
                 models_json_path().c_str(), e.what());
     }
-    // Backfill: guarantee every model carries its own individual settings
-    // schema, even entries registered before per-model seeding existed. Runs
-    // exactly once per entry (the `seeded` marker persists), so a user who
-    // later runs `anvil profile <name> unset k` keeps their choice instead of
-    // having the key silently re-seeded on the next load.
+
     bool changed = false;
     for (auto & e : models) {
         if (e.seeded) continue;
@@ -1332,11 +1218,10 @@ const ModelEntry * find_model(const std::vector<ModelEntry> & models, const std:
     return nullptr;
 }
 
-// Verbose GGUF header metadata (vocab-only load: fast, no weights).
 struct ModelMeta {
     std::string desc;
     int64_t     trained_ctx = 0;
-    nlohmann::json gguf_meta;   // every GGUF header key/value (strings)
+    nlohmann::json gguf_meta;
 };
 
 static ModelMeta read_model_meta(const std::string & path) {
@@ -1347,16 +1232,6 @@ static ModelMeta read_model_meta(const std::string & path) {
     LlamaModel m(llama_model_load_from_file(path.c_str(), mparams));
     if (!m) return meta;
 
-    // NOTE: this fork's loader returns from the hparams phase on vocab_only
-    // (llama-model.cpp: "if (hparams.vocab_only) return;"), so
-    // llama_model_desc()/llama_model_n_ctx_train() are empty for vocab-only
-    // models. The gguf_kv map is still fully populated, so we derive the
-    // description and trained context from the captured header instead. This
-    // also fixes the auto-ctx-from-model path, which was silently always 0.
-    // Verbose metadata: capture every GGUF header key/value (strings only).
-    // The *_by_index functions are snprintf-style: query the size with a null
-    // buffer, then fill. Values can exceed 4 KB (chat templates), so a fixed
-    // stack buffer would truncate; the two-call pattern is exact and safe.
     nlohmann::json meta_map = nlohmann::json::object();
     const int32_t count = llama_model_meta_count(m);
     if (count > 0 && count <= 4096) {
@@ -1386,11 +1261,10 @@ static ModelMeta read_model_meta(const std::string & path) {
     std::string name = meta_str("general.name");
     if (name.empty()) name = meta_str("general.basename");
 
-    // Trained context: general.context_length (modern) or <arch>.context_length.
     std::string ctx = meta_str("general.context_length");
     if (ctx.empty() && !arch.empty()) ctx = meta_str(arch + ".context_length");
     if (!ctx.empty()) {
-        // Values may look like "8192" or "[8192]"; grab the first integer.
+
         size_t i = 0;
         while (i < ctx.size() && !std::isdigit(static_cast<unsigned char>(ctx[i]))) i++;
         if (i < ctx.size()) {
@@ -1415,8 +1289,6 @@ static bool valid_kv_name(const std::string & n) {
     return false;
 }
 
-// Profile values reuse the same bounds as the CLI (set_int/set_float), so
-// `anvil profile x set temp=99` fails exactly like `--temp 99`.
 static bool parse_profile_value(const std::string & key, const std::string & val, ModelProfile & p) {
     int iv = 0; float fv = 0.0f;
     if (key == "n_ctx")      { if (!parse_int(val, iv) || iv < 1 || iv > MAX_CTX) return false; p.set(key, iv); return true; }
@@ -1438,9 +1310,6 @@ static bool parse_profile_value(const std::string & key, const std::string & val
     return false;
 }
 
-// ─── Name resolution ───────────────────────────────────────────────────────
-
-// True when the argument names a file (path-ish) rather than a registry name.
 static bool looks_like_file(const std::string & arg) {
     if (arg.find('/') != std::string::npos || arg.find('\\') != std::string::npos) return true;
     if (arg.size() > 5 && arg.compare(arg.size() - 5, 5, ".gguf") == 0) return true;
@@ -1448,8 +1317,6 @@ static bool looks_like_file(const std::string & arg) {
     return false;
 }
 
-// Resolve a `run` argument: registry name (friendly_out set) or a local file
-// (friendly_out left empty). Returns false when neither matches.
 bool resolve_model_arg(const std::string & arg, std::string & path_out, std::string & friendly_out) {
     const std::vector<ModelEntry> models = load_models();
     if (const ModelEntry * e = find_model(models, arg)) {
@@ -1465,11 +1332,6 @@ bool resolve_model_arg(const std::string & arg, std::string & path_out, std::str
     return false;
 }
 
-// ─── Commands ──────────────────────────────────────────────────────────────
-
-// Register a local file under a friendly name. Reuses an existing entry that
-// already points at the same file (canonical-path match) so running a file by
-// path never duplicates its registry entry under a second name.
 ModelEntry * auto_register(std::vector<ModelEntry> & models,
                            const std::string & path, const std::string & friendly,
                            const ModelMeta & meta) {
@@ -1536,9 +1398,7 @@ int cmd_rm(const std::vector<std::string> & args) {
 }
 
 int cmd_models(const std::vector<std::string> & args) {
-    // `list` is an alias for the default listing; the subcommand error below
-    // advertises it, so it must actually work. Trailing args are rejected to
-    // match the strictness of the other subcommands.
+
     if (args.size() > 1 && args[0] == "list") {
         fprintf(stderr, "error: unexpected argument '%s'\n", args[1].c_str());
         return 1;
@@ -1716,25 +1576,12 @@ int cmd_profile(const std::vector<std::string> & args) {
     return 0;
 }
 
-// ──── src/pull.hpp ────
 int cmd_pull(const std::vector<std::string> & args);
-
-// ──── src/pull.cpp ────
-// Model downloader: Ollama registry (OCI-style) + import from a local ollama
-// install. HTTP goes through curl (wget fallback) exactly like install.sh — no
-// new link-time dependencies, so the single binary stays dependency-free.
-//
-// Ollama models ARE GGUF: the `application/vnd.ollama.image.model` layer is
-// the weights file. "Converting" from ollama therefore means extracting the
-// GGUF blob plus its metadata layers (chat template, params, license) into a
-// persistent anvil profile.
 
 namespace {
 
 constexpr const char * OLLAMA_BASE = "https://registry.ollama.ai/v2";
 
-// Registry components are strictly [A-Za-z0-9._-]; validating before building
-// shell commands keeps the curl/system() invocation injection-safe on every OS.
 bool valid_registry_component(const std::string & s) {
     if (s.empty() || s.size() > 128) return false;
     for (const char ch : s) {
@@ -1744,9 +1591,6 @@ bool valid_registry_component(const std::string & s) {
     return true;
 }
 
-// Validates an OCI/registry blob digest (sha256:<64 hex>). Digests come from
-// remote manifests but are embedded into shell-quoted curl URLs below, so
-// anything outside that shape is rejected before it can reach a shell.
 bool valid_digest(const std::string & s) {
     if (s.compare(0, 7, "sha256:") != 0) return false;
     const std::string hex = s.substr(7);
@@ -1757,8 +1601,6 @@ bool valid_digest(const std::string & s) {
     return true;
 }
 
-// The HF API "sha" is a git commit SHA-1 (40 hex chars). It is embedded into
-// download URLs below, so only well-formed values are accepted.
 bool valid_hf_sha(const std::string & s) {
     if (s.size() != 40) return false;
     for (const char ch : s) {
@@ -1767,8 +1609,6 @@ bool valid_hf_sha(const std::string & s) {
     return true;
 }
 
-// HF file paths go into shell-quoted download URLs; restrict them to the same
-// safe charset as registry components.
 bool valid_hf_filename(const std::string & s) {
     if (s.empty() || s.size() > 256) return false;
     for (const char ch : s) {
@@ -1778,7 +1618,6 @@ bool valid_hf_filename(const std::string & s) {
     return true;
 }
 
-// Unique temp path for capturing command output (portable, no mkstemp).
 std::string pull_tmp_path() {
     static std::atomic<unsigned> counter{0};
     std::error_code ec;
@@ -1789,7 +1628,6 @@ std::string pull_tmp_path() {
                                             .time_since_epoch().count()) + ".tmp")).string();
 }
 
-// Runs a command and returns its stdout (empty on failure).
 std::string capture(const std::string & cmd) {
     const std::string tmp = pull_tmp_path();
     std::error_code ec;
@@ -1804,8 +1642,6 @@ std::string capture(const std::string & cmd) {
     return out;
 }
 
-// curl with a wget fallback, returning the response body. --max-time bounds
-// metadata fetches so a stalled endpoint fails fast instead of hanging.
 std::string http_get(const std::string & url, const std::string & extra_flags = "") {
     std::string out = capture("curl -fsSL --max-time 60 " + extra_flags + " \"" + url + "\"");
     if (out.empty()) {
@@ -1814,12 +1650,6 @@ std::string http_get(const std::string & url, const std::string & extra_flags = 
     return out;
 }
 
-// Downloads url to out_path atomically: writes <out>.part (resumable with
-// --continue-at), verifies the caller's checksum later, then renames. Returns
-// 0 on success; the .part is kept on failure so retries resume.
-// expected_size > 0 guards against a stale .part from an aborted run of a
-// *different* asset (e.g. a tag re-uploaded): a partial larger than the
-// target is corrupt, so it is discarded and the download restarts.
 int http_download(const std::string & url, const std::string & out_path,
                   uint64_t expected_size = 0) {
     const std::string part = out_path + ".part";
@@ -1833,8 +1663,7 @@ int http_download(const std::string & url, const std::string & out_path,
             std::filesystem::remove(part, st);
         }
     }
-    // --retry/--connect-timeout keep flaky or stalled connections from hanging
-    // a multi-GB download indefinitely.
+
     std::string cmd = "curl --fail --location --progress-bar --retry 3 --retry-delay 2 "
                       "--connect-timeout 20 --continue-at - -o \"" +
                       part + "\" \"" + url + "\"";
@@ -1854,8 +1683,6 @@ int http_download(const std::string & url, const std::string & out_path,
     return 0;
 }
 
-// sha256 hex of a file, via sha256sum or shasum (install.sh conventions).
-// Empty string when no tool is available.
 std::string sha256_of(const std::string & path) {
     std::string hex = capture("sha256sum \"" + path + "\" | awk '{print $1}'");
     while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) hex.pop_back();
@@ -1885,14 +1712,7 @@ bool parse_ollama_manifest(const std::string & json, OllamaManifest & out) {
             if (l.contains("mediaType")) layer.media_type = l["mediaType"].get<std::string>();
             if (l.contains("digest"))    layer.digest    = l["digest"].get<std::string>();
             if (l.contains("size"))      layer.size      = l["size"].get<uint64_t>();
-            // Layer digests are embedded into shell-quoted curl URLs later.
-            // Accept only sha256:<64 hex>, lowercased: OCI digests are
-            // canonically lowercase, and ollama-local blob files are stored
-            // on disk as sha256-<lowercase hex>, so any other spelling would
-            // fail validation here, break the blob-path lookup, or reach the
-            // shell. Malformed metadata layers are skipped rather than failing
-            // the whole manifest; the caller still hard-requires the model
-            // layer (the only one whose digest is indispensable).
+
             std::string digest = layer.digest;
             for (char & c : digest) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (!valid_digest(digest)) continue;
@@ -1905,8 +1725,6 @@ bool parse_ollama_manifest(const std::string & json, OllamaManifest & out) {
     }
 }
 
-// Maps Ollama params blob keys onto the model profile (in-range only, same
-// bounds as the CLI). The rest of the blob is kept raw in params_json.
 void apply_ollama_params(const nlohmann::json & params, ModelProfile & p) {
     if (!params.is_object()) return;
     auto num = [&](const char * k, float & out) -> bool {
@@ -1928,8 +1746,6 @@ void apply_ollama_params(const nlohmann::json & params, ModelProfile & p) {
     }
 }
 
-// Splits `[ns/]name[:tag]` (ollama/OCI convention), validating every part.
-// Returns false on invalid input.
 bool parse_ollama_spec(const std::string & spec,
                        std::string & ns, std::string & name, std::string & tag) {
     ns = "library";
@@ -1949,7 +1765,6 @@ bool parse_ollama_spec(const std::string & spec,
            valid_registry_component(tag);
 }
 
-// Registers a pulled/imported model, refreshing GGUF metadata from disk.
 int register_pulled(const std::string & friendly, const std::string & path,
                     const std::string & source, const std::string & source_id,
                     const std::string & template_text, const std::string & license,
@@ -1980,18 +1795,16 @@ int register_pulled(const std::string & friendly, const std::string & path,
     e.chat_template = template_text;
     e.license = license;
     e.params_json = params_json;
-    // Ollama params blob -> persistent profile defaults (same CLI bounds).
+
     try {
         if (!params_json.empty()) apply_ollama_params(nlohmann::json::parse(params_json), e.profile);
     } catch (const nlohmann::json::exception &) {}
-    // A manifest-claimed num_ctx is honored as-is — no clamping to trained
-    // context or any other artificial cap. The user asked for it, the KV
-    // cache (TurboQuant-compressed) will allocate or fail naturally.
+
     {
         auto it = e.profile.settings.find("n_ctx");
         if (it != e.profile.settings.end() && it->second.is_number_integer()) {
             const int64_t nctx = it->second.get<int64_t>();
-            if (nctx > MAX_CTX) it->second = static_cast<int64_t>(MAX_CTX);  // type ceiling only
+            if (nctx > MAX_CTX) it->second = static_cast<int64_t>(MAX_CTX);
         }
     }
     seed_model_profile(e.profile, e.trained_ctx, e.gguf_meta);
@@ -2021,9 +1834,8 @@ int register_pulled(const std::string & friendly, const std::string & path,
     return 0;
 }
 
-// Verifies a downloaded blob against its registry digest (sha256:<hex>).
 bool verify_digest(const std::string & path, const std::string & digest) {
-    if (digest.compare(0, 7, "sha256:") != 0) return true;   // unknown scheme: skip
+    if (digest.compare(0, 7, "sha256:") != 0) return true;
     const std::string expected = digest.substr(7);
     const std::string actual = sha256_of(path);
     if (actual.empty()) {
@@ -2039,11 +1851,6 @@ bool verify_digest(const std::string & path, const std::string & digest) {
     return true;
 }
 
-// Downloads + sha256-verifies a blob. A checksum mismatch discards the corrupt
-// file (final + .part) and retries once from scratch — a resumed .part can be
-// corrupt even when curl reports success, and resuming from the bad bytes
-// would loop forever. An empty digest skips verification. Returns 0 on
-// success; shared by the Ollama and HuggingFace pull paths.
 int download_verified(const std::string & url, const std::string & dest,
                       uint64_t expected_size, const std::string & digest) {
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -2058,7 +1865,6 @@ int download_verified(const std::string & url, const std::string & dest,
     return -1;
 }
 
-// Pulls one blob from the registry into models_dir. Returns 0 on success.
 int pull_blob(const std::string & ns, const std::string & model, const OllamaLayer & layer,
               const std::string & dest) {
     const std::string url = std::string(OLLAMA_BASE) + "/" + ns + "/" + model + "/blobs/" + layer.digest;
@@ -2066,17 +1872,12 @@ int pull_blob(const std::string & ns, const std::string & model, const OllamaLay
     return download_verified(url, dest, layer.size, layer.digest);
 }
 
-// ─── HuggingFace pulls ──────────────────────────────────────────────────────
-
 struct HfFile {
     std::string path;
     uint64_t    size = 0;
-    std::string oid;   // LFS sha256 hex, when the API exposes it
+    std::string oid;
 };
 
-// hf:<repo>[:<file>] — repo is owner/name (must contain '/'), the optional
-// file is everything after the second ':'. Both are validated against strict
-// allowlists before being embedded in shell commands (injection-safe).
 bool parse_hf_spec(const std::string & spec, std::string & repo, std::string & file) {
     repo = spec;
     file.clear();
@@ -2091,8 +1892,7 @@ bool parse_hf_spec(const std::string & spec, std::string & repo, std::string & f
         const unsigned char c = static_cast<unsigned char>(ch);
         if (!(std::isalnum(c) || c == '/' || c == '.' || c == '-' || c == '_')) return false;
     }
-    // Reject dot-path segments in the repo too (consistent with the file
-    // check): a repo like `../evil` must never reach a URL or shell command.
+
     if (repo.find("/.") != std::string::npos || repo.find("./") != std::string::npos ||
         repo.find("..") != std::string::npos) return false;
     if (file.empty()) return true;
@@ -2105,9 +1905,6 @@ bool parse_hf_spec(const std::string & spec, std::string & repo, std::string & f
     return true;
 }
 
-// Resolves the repo's default-branch commit sha via the models API. Some
-// repos default to `master` instead of `main`, so pinning `main` would break
-// them; the sha works for every repo. Returns false on 404/gated/network.
 bool resolve_hf_sha(const std::string & repo, std::string & sha) {
     const std::string url = "https://huggingface.co/api/models/" + repo;
     const std::string body = http_get(url);
@@ -2122,9 +1919,6 @@ bool resolve_hf_sha(const std::string & repo, std::string & sha) {
     return false;
 }
 
-// Lists top-level .gguf files of a HF repo at a pinned commit (tree API,
-// recursive), with LFS sizes and sha256 oids. Returns false only on a hard
-// failure (404/network); an empty `out` means the repo has no .gguf files.
 bool list_hf_files(const std::string & repo, const std::string & sha,
                    std::vector<HfFile> & out) {
     const std::string url = "https://huggingface.co/api/models/" + repo + "/tree/" + sha + "?recursive=true";
@@ -2138,8 +1932,7 @@ bool list_hf_files(const std::string & repo, const std::string & sha,
     }
     if (!j.is_array()) return false;
     for (const auto & f : j) {
-        // Only real files: the tree API also emits directory entries, and a
-        // directory literally named `x.gguf` must not be treated as a model.
+
         if (!f.is_object() || !f.contains("type") || !f["type"].is_string()) continue;
         std::string type;
         try { type = f["type"].get<std::string>(); } catch (const nlohmann::json::exception &) { continue; }
@@ -2148,8 +1941,8 @@ bool list_hf_files(const std::string & repo, const std::string & sha,
         std::string p;
         try { p = f["path"].get<std::string>(); } catch (const nlohmann::json::exception &) { continue; }
         if (p.size() < 5 || p.compare(p.size() - 5, 5, ".gguf") != 0) continue;
-        if (p.find('/') != std::string::npos) continue;   // top-level only
-        if (!valid_hf_filename(p)) continue;              // reject shell-hostile names
+        if (p.find('/') != std::string::npos) continue;
+        if (!valid_hf_filename(p)) continue;
         HfFile hf;
         hf.path = p;
         if (f.contains("size") && f["size"].is_number()) {
@@ -2161,13 +1954,12 @@ bool list_hf_files(const std::string & repo, const std::string & sha,
         }
         out.push_back(std::move(hf));
     }
-    // Smallest quant first — the usual picker ordering.
+
     std::sort(out.begin(), out.end(),
               [](const HfFile & a, const HfFile & b) { return a.size < b.size; });
     return true;
 }
 
-// Numbered interactive quant picker; returns the chosen index or -1.
 int pick_hf_file(const std::vector<HfFile> & files) {
     printf("%zu .gguf file(s):\n", files.size());
     for (size_t i = 0; i < files.size(); i++) {
@@ -2183,9 +1975,8 @@ int pick_hf_file(const std::vector<HfFile> & files) {
     return idx - 1;
 }
 
-} // namespace
+}
 
-// anvil pull hf:<owner>/<repo>[:<file.gguf>]  [--list]
 int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra) {
     bool list_only = false;
     for (const auto & a : extra) {
@@ -2203,8 +1994,6 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
         return 1;
     }
 
-    // The interactive picker needs a terminal; fail before any network work
-    // (and before scripting environments hang waiting on stdin).
     if (file.empty() && !list_only && !stdin_is_tty()) {
         fprintf(stderr, "error: interactive picker needs a terminal; pass the file explicitly:\n"
                         "  anvil pull hf:%s:<file.gguf>\n  anvil pull hf:%s --list\n",
@@ -2212,8 +2001,6 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
         return 1;
     }
 
-    // Resolve the default-branch commit once; it pins both the listing and
-    // the download URL, so non-`main` default branches work too.
     std::string sha;
     if (!resolve_hf_sha(repo, sha)) {
         fprintf(stderr, "\033[31merror: could not access '%s' (repo not found, gated, or network issue)\033[0m\n",
@@ -2270,7 +2057,6 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
         }
     }
 
-    // Friendly name from the quant filename: Llama-3.2-1B-Q4_K_M.gguf -> llama-3.2-1b-q4-k-m.
     const std::string friendly = slugify(std::filesystem::path(chosen->path).stem().string());
     const std::string source_id = repo + ":" + chosen->path;
 
@@ -2289,7 +2075,7 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
 
     const std::string url = "https://huggingface.co/" + repo + "/resolve/" + sha + "/" + chosen->path;
     printf("Downloading %s (%s)...\n", chosen->path.c_str(), format_size(chosen->size).c_str());
-    // The LFS oid is embedded into a verified download; require sha256:<64 hex>.
+
     std::string digest;
     if (chosen->oid.empty()) {
         fprintf(stderr, "\033[33mwarning: no sha256 available from the HF API; download will not be verified\033[0m\n");
@@ -2304,14 +2090,12 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
     return register_pulled(friendly, model_path, "hf", source_id, "", "", "");
 }
 
-// anvil pull ollama:[ns/]name[:tag]  |  ollama-local:[ns/]name[:tag]
 int cmd_pull(const std::vector<std::string> & args) {
     if (args.empty()) {
         fprintf(stderr, "usage: anvil pull ollama:<name>[:tag] | ollama-local:<name>[:tag] | hf:<repo>[:file]\n");
         return 1;
     }
 
-    // Source prefix: ollama (registry) / ollama-local (~/.ollama) / hf.
     std::string source = "ollama";
     std::string rest = args[0];
     const size_t colon = rest.find(':');
@@ -2325,7 +2109,7 @@ int cmd_pull(const std::vector<std::string> & args) {
     if (source == "hf") {
         return cmd_pull_hf(rest, std::vector<std::string>(args.begin() + 1, args.end()));
     }
-    // Ollama sources take exactly one argument (no flags yet).
+
     if (args.size() > 1) {
         fprintf(stderr, "error: unexpected argument '%s'\n", args[1].c_str());
         return 1;
@@ -2349,9 +2133,8 @@ int cmd_pull(const std::vector<std::string> & args) {
                     source_id.c_str());
             return 1;
         }
-    } else {  // ollama-local: import an already-pulled ollama install.
-        // Respect OLLAMA_MODELS (ollama's own store override); fall back to
-        // the default ~/.ollama/models location.
+    } else {
+
         std::string base;
         const char * om = std::getenv("OLLAMA_MODELS");
         if (om && om[0]) {
@@ -2378,15 +2161,14 @@ int cmd_pull(const std::vector<std::string> & args) {
             fprintf(stderr, "\033[31merror: unreadable manifest at %s\033[0m\n", mp.c_str());
             return 1;
         }
-        // Resolve layer paths to blob files (blobs are named sha256-<hex>).
+
         for (auto & layer : manifest.layers) {
             std::string fname = layer.digest;
             std::replace(fname.begin(), fname.end(), ':', '-');
-            layer.digest = base + "/blobs/" + fname;   // digest field now holds the path
+            layer.digest = base + "/blobs/" + fname;
         }
     }
 
-    // Separate layers by media type.
     const OllamaLayer * model_layer = nullptr;
     std::vector<const OllamaLayer *> template_layers, params_layers, license_layers;
     for (const auto & layer : manifest.layers) {
@@ -2422,26 +2204,23 @@ int cmd_pull(const std::vector<std::string> & args) {
         printf("Downloading %s (%s)...\n", friendly.c_str(), format_size(model_layer->size).c_str());
         if (pull_blob(ns, name, *model_layer, model_path) != 0) return 1;
     } else {
-        // Prefer a hardlink into anvil's own store: zero extra disk (same
-        // filesystem) and the model survives an ollama uninstall. Fall back to
-        // referencing the blob directly when the stores span filesystems.
+
         const std::string linked = models_dir() + "/" + friendly + ".gguf";
         std::error_code lk;
-        std::filesystem::remove(linked, lk);   // stale target from an aborted import
+        std::filesystem::remove(linked, lk);
         lk.clear();
         std::filesystem::create_hard_link(model_layer->digest, linked, lk);
         if (!lk) {
             model_path = linked;
             printf("Linked local blob into anvil store: %s\n", linked.c_str());
         } else {
-            model_path = model_layer->digest;   // direct blob reference, zero disk cost
+            model_path = model_layer->digest;
             fprintf(stderr, "\033[33mwarning: could not hardlink blob into anvil store (%s); "
                             "referencing directly — deleting the ollama store will break this model\033[0m\n",
                     lk.message().c_str());
         }
     }
 
-    // Metadata layers.
     std::string template_text, license_text, params_json;
     auto read_layer_text = [&](const OllamaLayer & layer) -> std::string {
         if (source == "ollama") {
@@ -2464,14 +2243,10 @@ int cmd_pull(const std::vector<std::string> & args) {
     return register_pulled(friendly, model_path, source == "ollama" ? "ollama" : "ollama-local",
                            source_id, template_text, license_text, params_json);
 }
-// ──── src/hardware.hpp ────
-
 
 HWInfo probe_hw();
 int derive_ngl(const HWInfo & hw);
 bool validate_gguf(const std::string & path);
-// ──── src/hardware.cpp ────
-
 
 #ifdef __APPLE__
 #endif
@@ -2494,7 +2269,7 @@ static void detect_gpus_macos(HWInfo & hw) {
 
     io_iterator_t iter = 0;
     const kern_return_t kr = IOServiceGetMatchingServices(mp, matching, &iter);
-    if (kr != KERN_SUCCESS) return;  // matching consumed by the call
+    if (kr != KERN_SUCCESS) return;
 
     io_object_t device;
     while ((device = IOIteratorNext(iter)) != 0) {
@@ -2526,7 +2301,7 @@ static std::string run_cmd(const std::string & cmd) {
 }
 
 static void detect_gpus_linux(HWInfo & hw) {
-    // nvidia-smi (when the proprietary driver is present)
+
     const std::string out = run_cmd(
         "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null");
     if (!out.empty()) {
@@ -2555,7 +2330,6 @@ static void detect_gpus_linux(HWInfo & hw) {
         }
     }
 
-    // sysfs PCI enumeration (works with any driver, incl. nouveau/amdgpu)
     glob_t globbuf;
     if (glob("/sys/class/drm/card*/device/vendor", 0, nullptr, &globbuf) == 0) {
         for (size_t i = 0; i < globbuf.gl_pathc; i++) {
@@ -2577,7 +2351,7 @@ static void detect_gpus_linux(HWInfo & hw) {
                 gpu.vendor = "Intel";
                 gpu.is_discrete = false;
             } else {
-                continue;  // vendor card* entries may duplicate; skip non-GPU vendors
+                continue;
             }
             std::ifstream df(base + "/device/device");
             std::string did;
@@ -2729,7 +2503,7 @@ HWInfo probe_hw() {
 }
 
 int derive_ngl(const HWInfo & hw) {
-    // Apple Silicon and any discrete GPU: offload everything (-1 = auto).
+
     if (hw.apple_silicon) return -1;
     if (!hw.gpus.empty()) return -1;
     return 0;
@@ -2743,10 +2517,6 @@ bool validate_gguf(const std::string & path) {
     return f.gcount() == 4 && memcmp(magic, "GGUF", 4) == 0;
 }
 
-// Error message for a failed import/run GGUF check. Distinguishes a missing
-// file (deleted, moved, or a typo'd path) from a real format problem, since
-// both used to say "not a valid GGUF file" and sent users chasing the wrong
-// thing.
 std::string gguf_check_error(const std::string & path) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec) {
@@ -2754,31 +2524,23 @@ std::string gguf_check_error(const std::string & path) {
     }
     return "'" + path + "' is not a valid GGUF file (missing GGUF magic; is the download complete?)";
 }
-// ──── src/setup.hpp ────
-
 
 AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx);
-// ──── src/setup.cpp ────
-
-
 
 AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
-    // Unknown model context (setup-only mode, or a header-less model): cap the
-    // option menu at a sane ceiling and default to 4096 instead of presenting
-    // a bare "Custom..." choice.
+
     const bool known_ctx = max_ctx > 0;
     if (max_ctx <= 0) max_ctx = 131072;
     AnvilConfig cfg;
     cfg.ngl = derive_ngl(hw);
     cfg.n_ctx = known_ctx ? max_ctx : 4096;
 
-    // Context options: powers of two up to the model's trained context.
     std::vector<int> ctx_options;
     for (int c = 1; c > 0 && c <= max_ctx; c *= 2) {
-        if (c > INT32_MAX / 2) break;   // stop before c *= 2 would overflow
+        if (c > INT32_MAX / 2) break;
         ctx_options.push_back(c);
     }
-    ctx_options.push_back(0);  // "Custom..."
+    ctx_options.push_back(0);
     const int custom_idx = static_cast<int>(ctx_options.size()) - 1;
     int ctx_sel = 0;
     for (size_t i = 0; i < ctx_options.size(); i++) {
@@ -2957,15 +2719,9 @@ AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
 
     return cfg;
 }
-// ──── src/chat.hpp ────
-
 
 int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
              std::vector<ModelEntry> & models);
-// ──── src/chat.cpp ────
-
-
-// ─── Session export ────────────────────────────────────────────────────────
 
 static std::string session_path() {
     namespace fs = std::filesystem;
@@ -2995,14 +2751,6 @@ static void export_session(const std::vector<ChatMessage> & msgs, const std::str
     fprintf(stderr, "\033[32mSession exported to %s\033[0m\n", path.c_str());
 }
 
-// ─── Text helpers ──────────────────────────────────────────────────────────
-
-// Token -> piece. llama_token_to_piece follows the llama.cpp sizing
-// convention: a negative return is the required size (not an error), so a
-// null-buffer probe can never be used to size the buffer. This matches the
-// backend's own token_to_piece_for_cache: start small, resize on negative,
-// retry. (The previous null/0 probe returned negative for every token,
-// silently swallowing all generated text.)
 static std::string token_to_str(const llama_vocab * vocab, llama_token token) {
     std::string s(16, '\0');
     int n = llama_token_to_piece(vocab, token, s.data(), static_cast<int32_t>(s.size()), 0, true);
@@ -3010,7 +2758,7 @@ static std::string token_to_str(const llama_vocab * vocab, llama_token token) {
         s.resize(static_cast<size_t>(-n));
         n = llama_token_to_piece(vocab, token, s.data(), static_cast<int32_t>(s.size()), 0, true);
     }
-    if (n < 0) n = 0;   // still too small: give up on this piece
+    if (n < 0) n = 0;
     s.resize(static_cast<size_t>(n));
     return s;
 }
@@ -3040,14 +2788,11 @@ static void print_ctx_bar(int used, int total) {
             static_cast<int>(pct * 100.0f), used, total);
 }
 
-// ─── Sampler chain ─────────────────────────────────────────────────────────
-
 static llama_sampler * build_sampler_chain(
         const llama_vocab * vocab, const AnvilConfig & cfg,
         bool grammar_active, const std::string & grammar_src) {
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    // Order follows upstream llama.cpp: filtering samplers, then penalties,
-    // then the token selector, then grammar (last, as it overrides selection).
+
     if (cfg.top_k > 0) llama_sampler_chain_add(smpl, llama_sampler_init_top_k(cfg.top_k));
     if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(cfg.top_p, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
@@ -3060,9 +2805,6 @@ static llama_sampler * build_sampler_chain(
     }
     return smpl;
 }
-
-// ─── Tokenize helpers ──────────────────────────────────────────────────────
-// Returns a negative count on overflow (INT32_MIN), guarded before negation.
 
 static std::vector<llama_token> tokenize_render(
         const llama_vocab * vocab, const std::string & text) {
@@ -3078,8 +2820,6 @@ static std::vector<llama_token> tokenize_render(
     toks.resize(static_cast<size_t>(m));
     return toks;
 }
-
-// ─── Chat REPL ─────────────────────────────────────────────────────────────
 
 int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
              std::vector<ModelEntry> & models) {
@@ -3123,11 +2863,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = static_cast<uint32_t>(cfg.n_ctx);
-    cparams.n_batch   = cparams.n_ctx;    // logical batch == ctx: no batching caps.
-    // n_ubatch stays at the backend default (512): it sizes the compute-graph
-    // scratch, which must NOT scale with ctx (GBs at 262k) — TurboQuant only
-    // compresses the KV cache. Setting ubatch=n_ctx makes huge contexts fail
-    // to allocate graph buffers, which is exactly the OOM trap we avoid.
+    cparams.n_batch   = cparams.n_ctx;
+
     cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
     cparams.flash_attn_type = cfg.flash_attn
         ? LLAMA_FLASH_ATTN_TYPE_ENABLED
@@ -3144,7 +2881,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return 1;
     }
 
-    // Grammar (read once, kept alive for the whole session).
     bool grammar_active = false;
     std::string grammar_src;
     if (!cli.grammar.empty()) {
@@ -3153,7 +2889,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             fprintf(stderr, "\033[31merror: cannot open grammar file '%s'\033[0m\n", cli.grammar.c_str());
         } else {
             grammar_src.assign(std::istreambuf_iterator<char>(gf), std::istreambuf_iterator<char>());
-            // Validate the grammar parses before building the real chain.
+
             LlamaSampler probe(llama_sampler_init_grammar(vocab, grammar_src.c_str(), "root"));
             grammar_active = static_cast<bool>(probe);
             if (!grammar_active) {
@@ -3181,11 +2917,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     if (grammar_active) printf("  grammar : %s\n", cli.grammar.c_str());
     printf("  commands: /exit /clear /stats /undo /export /model /temp <f> /ctx <n>\n\n");
 
-    // Conversation state. history owns every string; the llama_chat_message
-    // view is rebuilt fresh for each template call, so no c_str() pointer can
-    // ever dangle (fixes the previous role-pointer use-after-free).
     std::vector<ChatMessage> history;
-    std::vector<llama_token> prev_tokens;  // tokens currently decoded in the KV
+    std::vector<llama_token> prev_tokens;
     Utf8Buffer utf8_buf;
     int total_tokens_generated = 0;
     double total_gen_time = 0.0;
@@ -3198,8 +2931,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         history.push_back({"system", sys_prompt});
     }
 
-    // Render the full conversation (add_ass=false stops before the assistant
-    // turn's header). Returns false when the model has no usable template.
     auto render_conversation = [&](bool add_ass, std::string & out) -> bool {
         if (!tmpl || !tmpl[0]) return false;
         std::vector<llama_chat_message> msgs;
@@ -3218,8 +2949,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    // Decode a batch of tokens, splitting into n_batch-sized chunks and
-    // respecting the context limit. Positions are auto-tracked by the fork.
     llama_memory_t mem = llama_get_memory(ctx);
     auto decode_tokens = [&](const std::vector<llama_token> & toks) -> bool {
         const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
@@ -3241,10 +2970,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    // Generation loop over the currently decoded state. Streaming output is
-    // routed through the markdown renderer (thinking tags, bold/italic/code,
-    // headings, quotes, fences); the raw text still goes into `response` so
-    // history and /export keep the unfiltered markdown.
     MarkdownStream md;
     auto generate = [&](std::string & response, GenStats & stats) -> bool {
         llama_sampler_reset(smpl.get());
@@ -3274,7 +2999,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             }
             response += piece;
             stats.tokens_generated++;
-            prev_tokens.push_back(id);   // keep KV tracking in sync
+            prev_tokens.push_back(id);
             llama_sampler_accept(smpl.get(), id);
 
             llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
@@ -3295,10 +3020,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return decode_ok;
     };
 
-    // Prepare a new user turn: renders the full conversation, re-tokenizes,
-    // and decodes only the delta (or falls back to a full re-decode when the
-    // previous state is no longer a prefix — e.g. after /undo, /clear, or a
-    // template that re-tokenizes differently).
     auto start_turn = [&](std::string & formatted) -> bool {
         std::vector<llama_token> all = tokenize_render(vocab, formatted);
         if (all.empty()) {
@@ -3306,27 +3027,26 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             return false;
         }
         if (!prev_tokens.empty()) {
-            // Incremental: only decode tokens beyond what is already in the KV.
+
             if (prev_tokens.size() <= all.size() &&
                 std::equal(prev_tokens.begin(), prev_tokens.end(), all.begin())) {
                 std::vector<llama_token> delta(all.begin() + static_cast<long>(prev_tokens.size()), all.end());
-                if (delta.empty()) return true;   // nothing new to decode
+                if (delta.empty()) return true;
                 if (!decode_tokens(delta)) return false;
                 prev_tokens = std::move(all);
                 return true;
             }
-            // Prefix mismatch: full re-decode.
+
             llama_memory_clear(mem, true);
             prev_tokens.clear();
         }
-        // First turn or full re-decode: add BOS manually (templates don't emit
-        // it, and the fork's add_special path can double it on some templates).
+
         std::vector<llama_token> full;
         full.reserve(all.size() + 1);
         if (add_bos && (all.empty() || all[0] != bos_id)) full.push_back(bos_id);
         full.insert(full.end(), all.begin(), all.end());
         if (!decode_tokens(full)) return false;
-        prev_tokens = std::move(all);   // track render tokens (BOS is implicit)
+        prev_tokens = std::move(all);
         return true;
     };
 
@@ -3336,48 +3056,36 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         }
     };
 
-    // Recreate the context at a new size and re-decode the conversation so
-    // `/ctx <n>` works mid-session. The fresh context starts empty; we then
-    // re-decode exactly what was in the KV (the template-rendered history),
-    // so subsequent turns keep working incrementally. All downstream lambdas
-    // capture ctx/mem by reference, so swapping both here is sufficient.
-    //
-    // The swap is atomic: everything that can fail (token count vs new size,
-    // context init) is validated BEFORE the old context is freed, so a failed
-    // resize leaves the session fully intact.
     auto reload_context = [&](uint32_t new_ctx) -> bool {
-        // Tokenize the conversation first (vocab-only; needs no context).
+
         std::string formatted;
         const bool have_render = render_conversation(false, formatted);
         std::string text;
         if (have_render && !formatted.empty()) {
             text = formatted;
         } else if (!history.empty()) {
-            // No usable chat template: fall back to raw concatenation so the
-            // conversation isn't silently lost on resize. Note: for such
-            // models the next turn takes the raw fallback path anyway, so the
-            // reloaded history only matters until then (pre-existing limit).
+
             for (const auto & m : history) text += m.content + "\n";
         }
-        // Empty session: still resize, but there is nothing to re-decode.
+
         std::vector<llama_token> all = tokenize_render(vocab, text);
         if (!all.empty() && all.size() + (add_bos ? 1u : 0u) > new_ctx) {
             fprintf(stderr, "\033[31merror: conversation (%zu tokens) does not fit in %u\033[0m\n",
                     all.size(), new_ctx);
-            return false;   // old context untouched
+            return false;
         }
-        // Init into a local; only swap in once it is valid.
+
         cparams.n_ctx    = new_ctx;
-        cparams.n_batch  = new_ctx;   // logical batch follows ctx (n_ubatch stays 512)
+        cparams.n_batch  = new_ctx;
         LlamaContext new_ctx_obj(llama_init_from_model(model, cparams));
         if (!new_ctx_obj) {
             fprintf(stderr, "\033[31merror: failed to recreate context at %u tokens\033[0m\n", new_ctx);
-            return false;   // old context untouched
+            return false;
         }
-        ctx = std::move(new_ctx_obj);   // frees the old context only now
+        ctx = std::move(new_ctx_obj);
         mem = llama_get_memory(ctx);
         prev_tokens.clear();
-        if (all.empty()) return true;   // nothing to re-decode
+        if (all.empty()) return true;
 
         std::vector<llama_token> full;
         full.reserve(all.size() + 1);
@@ -3391,10 +3099,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    // In-chat setting changes persist straight into the running model's
-    // profile (~/.anvil/models.json), so they survive across sessions.
-    // Only fires for a registered model (cli.friendly is always set by the
-    // run dispatcher — registry name or derived slug for path-runs).
     auto persist_chat_setting = [&](const std::string & key, const nlohmann::json & value) {
         if (cli.friendly.empty()) return;
         if (ModelEntry * e = find_model(models, cli.friendly)) {
@@ -3409,7 +3113,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     };
 
     if (cli.prompt.empty()) {
-        // ─── Interactive REPL ──────────────────────────────────────────────
+
         while (true) {
             g_interrupted.store(false);
             const int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
@@ -3505,8 +3209,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 cfg.temp = new_temp;
                 smpl.reset(build_sampler_chain(vocab, cfg, grammar_active, grammar_src));
                 printf("Temperature set to %.2f\n", new_temp);
-                // Store rounded to 2 decimals in double precision so the
-                // float32 value doesn't leak as 0.8999999761581421 in JSON.
+
                 persist_chat_setting("temp", std::round(static_cast<double>(new_temp) * 100.0) / 100.0);
                 printf("\n");
                 continue;
@@ -3552,7 +3255,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             history.push_back({"user", user_input});
             std::string formatted;
             if (!render_conversation(true, formatted)) {
-                // No chat template: fall back to raw prompt.
+
                 history.pop_back();
                 llama_memory_clear(mem, true);
                 prev_tokens.clear();
@@ -3586,7 +3289,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             finish_turn(resp);
         }
     } else {
-        // ─── Single-shot mode ──────────────────────────────────────────────
+
         history.push_back({"user", cli.prompt});
         std::string formatted;
         bool have_render = render_conversation(true, formatted);
@@ -3618,8 +3321,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     printf("\nExiting.\n");
     return 0;
 }
-// ──── src/main.cpp ────
-
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -3633,21 +3334,17 @@ int main(int argc, char ** argv) {
     if (cli.help)    { print_usage(); return 0; }
     if (cli.version) { printf("anvil %s\n", ANVIL_VERSION); return 0; }
 
-    // Subcommand dispatch (registry / profile / pull / rm).
     if (cli.sub == "models")  return cmd_models(cli.sub_args);
     if (cli.sub == "profile") return cmd_profile(cli.sub_args);
     if (cli.sub == "rm")      return cmd_rm(cli.sub_args);
     if (cli.sub == "pull")    return cmd_pull(cli.sub_args);
 
-    // `anvil --setup` is the one invocation allowed without a model: it
-    // re-runs the hardware/setup TUI and saves the config.
     if (cli.model.empty() && !cli.setup) {
         fprintf(stderr, "error: no model specified\n\n");
         print_usage();
         return 1;
     }
 
-    // Resolve a friendly registry name or a local file path.
     std::string resolved_path;
     std::string friendly;
     if (!cli.model.empty()) {
@@ -3660,7 +3357,7 @@ int main(int argc, char ** argv) {
         }
         cli.model = resolved_path;
         if (friendly.empty()) {
-            // Local file: derive a friendly name for the registry.
+
             friendly = slugify(std::filesystem::path(cli.model).stem().string());
         }
         cli.friendly = friendly;
@@ -3673,8 +3370,6 @@ int main(int argc, char ** argv) {
 
     const HWInfo hw = probe_hw();
 
-    // Read GGUF header metadata (vocab only) for context defaults + registry.
-    // Skipped in setup-only mode (no model to inspect).
     ModelMeta meta;
     if (!cli.model.empty()) meta = read_model_meta(cli.model);
     const int max_ctx = static_cast<int>(meta.trained_ctx);
@@ -3690,7 +3385,7 @@ int main(int argc, char ** argv) {
         write_config(cfg);
         fprintf(stderr, "\nConfig saved to %s\n", config_path().c_str());
         if (cli.model.empty()) {
-            // `anvil --setup` without a model: probe + save only.
+
             fprintf(stderr, "Hardware probe complete. Run 'anvil <model>' to start a session.\n");
             return 0;
         }
@@ -3709,8 +3404,6 @@ int main(int argc, char ** argv) {
                 gpu.is_discrete ? " [discrete]" : "");
     }
 
-    // Registry: auto-register local files and apply the model's persistent
-    // profile (explicit profile keys win over the global config).
     std::vector<ModelEntry> models = load_models();
     ModelEntry * entry = find_model(models, friendly);
     if (!entry) {
@@ -3719,24 +3412,20 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Registered local model as '%s' (see: anvil models)\n", friendly.c_str());
     }
     if (entry) {
-        // The entry may pre-exist under a different name (canonical-path match).
+
         if (cli.friendly != entry->name) cli.friendly = entry->name;
         friendly = entry->name;
         if (!std::filesystem::exists(entry->path)) {
             fprintf(stderr, "\033[33mwarning: registered model file missing: %s\033[0m\n", entry->path.c_str());
         }
-        // Refresh metadata + file size from disk (pulls may update the file).
+
         entry->desc = meta.desc;
         entry->trained_ctx = meta.trained_ctx;
         if (!meta.gguf_meta.empty()) entry->gguf_meta = meta.gguf_meta;
         std::error_code ec;
         const auto sz = std::filesystem::file_size(cli.model, ec);
         if (!ec) entry->size_bytes = sz;
-        // The setup TUI just ran for this model: persist its choices as the
-        // model's individual profile (populated by the user via setup), so
-        // every model keeps its own settings instead of inheriting globals.
-        // Works for imported models and path-run models alike (both get a
-        // registry entry here).
+
         if (setup_ran) {
             ModelProfile & p = entry->profile;
             p.set("n_ctx", cfg.n_ctx);
@@ -3754,7 +3443,6 @@ int main(int argc, char ** argv) {
                 static_cast<int>(entry->profile.settings.size()));
     }
 
-    // CLI overrides win over profile and global config.
     if (cli.n_ctx > 0)          cfg.n_ctx = cli.n_ctx;
     if (cfg.n_ctx <= 0 && max_ctx > 0) cfg.n_ctx = max_ctx;
     if (cli.ngl >= 0)           cfg.ngl = cli.ngl;
@@ -3770,7 +3458,6 @@ int main(int argc, char ** argv) {
     if (!cli.type_k.empty())    cfg.type_k = kv_type_from_name(cli.type_k);
     if (!cli.type_v.empty())    cfg.type_v = kv_type_from_name(cli.type_v);
 
-    // --save: persist explicit CLI overrides into the model's profile.
     if (cli.save_profile && entry) {
         ModelProfile & p = entry->profile;
         if (cli.n_ctx > 0)               p.set("n_ctx", cli.n_ctx);
@@ -3783,14 +3470,14 @@ int main(int argc, char ** argv) {
         if (cli.flash_attn)              p.set("flash_attn", true);
         if (cli.no_flash_attn)           p.set("flash_attn", false);
         if (cli.mtp)                     p.set("mtp", true);
-        // Normalize KV names so a bad --type-k can't poison the profile.
+
         if (!cli.type_k.empty() && valid_kv_name(cli.type_k)) p.set("type_k", cli.type_k);
         if (!cli.type_v.empty() && valid_kv_name(cli.type_v)) p.set("type_v", cli.type_v);
         if (!cli.system_prompt.empty())  p.set("system_prompt", cli.system_prompt);
         save_models(models);
         fprintf(stderr, "Saved %zu setting(s) to profile '%s'\n", p.settings.size(), friendly.c_str());
     } else if (entry) {
-        save_models(models);   // persist refreshed metadata
+        save_models(models);
     }
 
     cfg.model = cli.model;

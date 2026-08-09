@@ -1,64 +1,23 @@
 #!/bin/sh
 set -e
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  anvil-nvidia-install.sh — NVIDIA driver installer for ANY Linux distro
-#  Part of anvil (https://github.com/Anvil-LLM/anvil)
-#
-#  Universal by design:
-#    * Uses NVIDIA's official distribution-independent .run installer with
-#      --dkms, so the kernel module survives every kernel update on any distro.
-#      (NVIDIA calls this method "distribution-independent".)
-#    * Reads your actual hardware: detects GPU generation and automatically
-#      picks the correct driver branch:
-#        - Turing and newer (RTX, GTX 16xx, A/H/B-series) -> latest driver
-#        - Pascal / Maxwell (GTX 10xx, GTX 9xx)           -> 580 series
-#        - Kepler (GTX 6xx/7xx)                           -> 470 series
-#      (Since 590, NVIDIA ships open kernel modules only; pre-Turing cards
-#      need the last proprietary branches, 580 and 470.)
-#    * The only distro-specific step is the tiny build toolchain (kernel
-#      headers + gcc + make + dkms) — there is no way around distro packages
-#      for those, but that is all they are used for.
-#
-#  Design rules (from the anvil CUDA-prebuilt project):
-#    * The driver is the ONLY thing this installs. The anvil CUDA prebuilt
-#      ships its CUDA runtime (libcudart/libcublas), so users never touch the
-#      CUDA toolkit.
-#    * Nothing is ever auto-sudo'd from a curl | sh pipeline: non-interactive
-#      runs require an explicit --yes, and the privileged step stays one
-#      explicit sudo command the user types.
-#    * Every command is previewed before it runs (--dry-run prints exactly
-#      what will execute).
-#
-#  Usage:
-#    sudo ./anvil-nvidia-install.sh                universal install (default)
-#    sudo ./anvil-nvidia-install.sh --check        report only, changes nothing
-#    sudo ./anvil-nvidia-install.sh --dry-run      show every command, run none
-#    sudo ./anvil-nvidia-install.sh --yes          skip confirmations
-#    sudo ./anvil-nvidia-install.sh --driver 580.178.04   pin a driver version
-#    sudo ./anvil-nvidia-install.sh --distro       distro packages instead (opt-in)
-#    sudo ./anvil-nvidia-install.sh --nvidia-all   Frogging-Family nvidia-all (Arch)
-# ─────────────────────────────────────────────────────────────────────────────
-
 VERSION="0.2.0"
 SCRIPT_NAME=$(basename "$0")
 NVIDIA_BASE_X86="https://download.nvidia.com/XFree86/Linux-x86_64"
 NVIDIA_BASE_ARM="https://download.nvidia.com/XFree86/Linux-aarch64"
 
-# ─── Helpers (same conventions as install.sh) ──────────────────────────────
 log()   { printf "%s\n" "$1"; }
 err()   { printf "error: %s\n" "$1" >&2; }
 die()   { err "$1"; exit 1; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 is_tty()  { [ -t 0 ] && [ -t 1 ]; }
 
-# ─── Flags ─────────────────────────────────────────────────────────────────
 HELP=0
 SHOW_VERSION=0
 CHECK_ONLY=0
 DRY_RUN=0
 YES=0
-MODE="universal"          # universal | distro | nvidia-all
+MODE="universal"
 DRIVER_OVERRIDE=""
 TMP_DIR=""
 trap '[ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"' EXIT
@@ -126,7 +85,6 @@ parse_flags() {
     done
 }
 
-# Execute a command, or print it under --dry-run.
 run() {
     if [ "$DRY_RUN" = 1 ]; then
         log "  would run: $*"
@@ -135,12 +93,11 @@ run() {
     "$@"
 }
 
-# ─── Detection ─────────────────────────────────────────────────────────────
 FAMILY="other"
 DISTRO_ID=""
 GPU_LINE=""
 NVIDIA_PRESENT=0
-GPU_GEN="unknown"          # modern | pascal | kepler | unknown
+GPU_GEN="unknown"
 DRIVER_VERSION=""
 DRIVER_INSTALLED=0
 SB_ENABLED=0
@@ -154,7 +111,7 @@ detect_distro() {
         FAMILY="other"
         return 0
     fi
-    # shellcheck disable=SC1091
+
     . /etc/os-release
     DISTRO_ID=${ID:-unknown}
     DISTRO_LIKE=${ID_LIKE:-}
@@ -191,8 +148,6 @@ detect_gpu() {
     [ -z "$GPU_LINE" ] && GPU_LINE="NVIDIA GPU (vendor 10de)"
 }
 
-# Classify GPU generation from the lspci name so the correct driver branch is
-# selected. Order matters: modern first, then Pascal/Maxwell, then Kepler.
 detect_gpu_gen() {
     GPU_GEN="unknown"
     [ "$NVIDIA_PRESENT" = 1 ] || return 0
@@ -228,7 +183,6 @@ detect_session() {
     if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then SESSION_TYPE="graphical"; fi
 }
 
-# ─── Driver version resolution (needs network) ─────────────────────────────
 nvidia_base() {
     case "$ARN" in
         x86_64)  printf '%s' "$NVIDIA_BASE_X86" ;;
@@ -237,7 +191,6 @@ nvidia_base() {
     esac
 }
 
-# Latest 580.x / 470.x from the browsable version index.
 latest_branch_version() {
     _branch=$1
     curl -fsSL "$(nvidia_base)/" 2>/dev/null \
@@ -248,8 +201,7 @@ latest_branch_version() {
 }
 
 resolve_driver() {
-    # Resolves the version to INSTALL. DRIVER_VERSION is left holding the
-    # already-installed driver (if any) for reporting.
+
     INSTALL_VERSION=""
     if [ -n "$DRIVER_OVERRIDE" ]; then
         INSTALL_VERSION=$DRIVER_OVERRIDE
@@ -259,7 +211,7 @@ resolve_driver() {
             pascal) INSTALL_VERSION=$(latest_branch_version 580) ;;
             kepler) INSTALL_VERSION=$(latest_branch_version 470) ;;
             *)
-                # Unknown generation: default to the latest driver and say so.
+
                 INSTALL_VERSION=$(curl -fsSL "$(nvidia_base)/latest.txt" 2>/dev/null | awk '{print $1}' || true)
                 ;;
         esac
@@ -270,7 +222,6 @@ resolve_driver() {
     DRIVER_URL="$(nvidia_base)/${INSTALL_VERSION}/NVIDIA-Linux-${ARN}-${INSTALL_VERSION}.run"
 }
 
-# ─── Report ────────────────────────────────────────────────────────────────
 print_report() {
     _branch_note=""
     case "$GPU_GEN" in
@@ -301,7 +252,6 @@ print_report() {
     log ""
 }
 
-# ─── Toolchain (the only distro-specific step) ─────────────────────────────
 install_toolchain() {
     _kver=$(uname -r)
     case "$FAMILY" in
@@ -341,7 +291,6 @@ install_toolchain() {
     esac
 }
 
-# ─── Universal install: official NVIDIA .run + DKMS ────────────────────────
 install_universal() {
     install_toolchain
 
@@ -355,17 +304,13 @@ install_universal() {
     run curl -fSL -o "$TMP_DIR/installer.run" "$DRIVER_URL"
 
     if [ "$DRY_RUN" != 1 ]; then
-        # Sanity check: the .run is a 100+ MB self-extracting archive; a tiny
-        # file means a captive-portal or error page slipped past curl -f.
+
         _size=$(wc -c < "$TMP_DIR/installer.run" 2>/dev/null || echo 0)
         if [ "$_size" -lt 10485760 ]; then
             die "downloaded installer looks wrong (${_size} bytes) - network issue?"
         fi
     fi
 
-    # The official installer: --dkms keeps the module rebuilt on every kernel
-    # update; open kernel modules are the default on modern (590+) versions.
-    # shellcheck disable=SC2086
     _flags="--silent --accept-license --dkms --no-x-check --no-cc-version-check"
     if [ "$NOUVEAU_LOADED" = 1 ]; then
         _flags="$_flags --no-nouveau-check"
@@ -376,7 +321,6 @@ install_universal() {
     TMP_DIR=""
 }
 
-# ─── Opt-in: distro packages ───────────────────────────────────────────────
 install_distro() {
     case "$FAMILY" in
         debian)
@@ -419,7 +363,6 @@ install_distro() {
     esac
 }
 
-# ─── Opt-in: Frogging-Family/nvidia-all (mature on Arch) ───────────────────
 install_nvidia_all() {
     has_cmd git || die "git is required for --nvidia-all"
     run git clone --depth 1 https://github.com/Frogging-Family/nvidia-all.git /tmp/anvil-nvidia-all
@@ -435,7 +378,6 @@ do_install() {
     esac
 }
 
-# ─── Plan / confirm ────────────────────────────────────────────────────────
 print_plan() {
     _branch_note=""
     case "$GPU_GEN" in
@@ -469,7 +411,6 @@ confirm_install() {
     esac
 }
 
-# ─── Post-install ──────────────────────────────────────────────────────────
 secure_boot_advice() {
     [ "$SB_ENABLED" = 1 ] || return 0
     log ""
@@ -506,7 +447,6 @@ post_install() {
     fi
 }
 
-# ─── Main ──────────────────────────────────────────────────────────────────
 main() {
     parse_flags "$@"
     [ "$HELP" = 1 ] && { usage; exit 0; }
@@ -535,8 +475,6 @@ main() {
         exit 0
     fi
 
-    # The "no auto-sudo from curl | sh" rule: non-interactive without an
-    # explicit --yes never installs anything.
     if ! is_tty && [ "$YES" != 1 ] && [ "$DRY_RUN" != 1 ]; then
         die "non-interactive shell. Re-run with --yes to confirm, or --dry-run to preview."
     fi
@@ -548,7 +486,6 @@ main() {
         die "no NVIDIA GPU detected. This installer is for NVIDIA hardware only."
     fi
 
-    # Root is only required to actually install (never for --check/--dry-run).
     if [ "$DRY_RUN" != 1 ] && [ "$(id -u)" != 0 ]; then
         die "must run as root. Use: sudo $0 $*"
     fi

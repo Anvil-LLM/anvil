@@ -31,8 +31,6 @@ aarch64|arm64) ARN=aarch64 ;;
 esac
 ASSET="anvil-${OSN}-${ARN}"
 
-# NVIDIA CUDA prebuilt (Linux x86_64 only). Detection is additive: the plain
-# CPU/Vulkan asset always remains the fallback if the CUDA one is missing.
 NVIDIA=0
 CUDA_ASSET=""
 detect_nvidia_gpu() {
@@ -68,11 +66,9 @@ _file=$1
 _asset=${2:-$ASSET}
 [ -n "$ANVIL_SKIP_CHECKSUM" ] && { log "Checksum verification skipped (ANVIL_SKIP_CHECKSUM set)."; return 0; }
 log "Verifying checksum..."
-# The tag endpoint lists every asset with its sha256 digest. Collapse the JSON
-# to one line, then pull the digest belonging to our asset name.
+
 _meta=$(http_get_stdout "${API_URL}/tags/${TAG}" 2>/dev/null | tr -d '\n')
-# Asset JSON contains a nested "uploader" object, so a naive [^}]* regex can
-# never reach "digest" - parse it properly with python3/jq when available.
+
 _digest=""
 if has_cmd python3; then
     _digest=$(printf '%s' "$_meta" | ANVIL_ASSET="$_asset" python3 -c '
@@ -94,9 +90,7 @@ if [ -z "$_digest" ] && has_cmd jq; then
     _digest=$(printf '%s' "$_meta" | jq -r --arg n "$_asset" '.assets[] | select(.name == $n) | .digest' 2>/dev/null | sed 's/^sha256://' | head -1)
 fi
 if [ -z "$_digest" ]; then
-    # Last-resort regex. BSD grep caps interval repetition at 255, so the
-    # window between the asset name and its digest (spans the nested uploader
-    # object) is matched as 4 x {0,150} instead of {0,600}.
+
     _digest=$(printf '%s' "$_meta" | grep -oE "\"name\"[[:space:]]*:[[:space:]]*\"${_asset}\".{0,150}.{0,150}.{0,150}.{0,150}\"digest\"[[:space:]]*:[[:space:]]*\"sha256:[0-9a-f]{64}\"" | head -1 | sed 's/.*sha256://; s/"$//')
 fi
 if [ -z "$_digest" ]; then log "warning: no checksum available for ${_asset}; skipping verification"; return 0; fi
@@ -109,8 +103,7 @@ log "Checksum OK (sha256:${_digest})"
 
 install_binary() {
 resolve_tag
-# Prefer the CUDA prebuilt on NVIDIA Linux x86_64; the plain CPU/Vulkan asset
-# is the automatic fallback if the CUDA one is unavailable or won't run.
+
 for _asset in ${CUDA_ASSET:-} "$ASSET"; do
     [ -n "$_asset" ] || continue
     URL="${REPO_URL}/releases/download/${TAG}/${_asset}"
@@ -120,9 +113,7 @@ for _asset in ${CUDA_ASSET:-} "$ASSET"; do
         log "  ${_asset} unavailable at ${TAG}; trying fallback"
         continue
     fi
-    # curl/wget never preserve the exec bit; without this the --version probe
-    # below fails with "Permission denied" on EVERY platform and the installer
-    # wrongly reports "does not run on this system".
+
     chmod +x "$TMP_BIN" 2>/dev/null || {
         log "  could not execute ${_asset}; trying fallback"
         continue
@@ -135,8 +126,7 @@ for _asset in ${CUDA_ASSET:-} "$ASSET"; do
         log "  ${_asset} does not run on this system (missing libraries?); trying fallback"
         continue
     fi
-    # Explicit failure guards: install_binary may be called in a context that
-    # suppresses set -e (e.g. "install_binary || exit 1"), so check each step.
+
     if ! ${PRIV}mv "$TMP_BIN" "$TARGET/anvil"; then
         err "could not write ${TARGET}/anvil (run with sudo, or pick a writable target)"
         return 1
@@ -149,8 +139,6 @@ err "no prebuilt binary worked for ${OSN}/${ARN} (tried: ${CUDA_ASSET:-none} ${A
 return 1
 }
 
-# NVIDIA driver helper (downloads the installer, never runs it for you — the
-# privileged step stays one explicit sudo command the user types themselves).
 DRIVER_URL="https://raw.githubusercontent.com/${REPO}/main/docs/anvil-nvidia-install.sh"
 offer_nvidia_driver() {
     [ "$OSN" = "linux" ] || return 0
@@ -194,9 +182,7 @@ cmake --build "$SRC_DIR/build" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/de
 BIN_TMP="${TARGET}/.anvil-bin.$$"
 trap 'rm -f "$BIN_TMP" 2>/dev/null' EXIT
 ${PRIV}cp "$SRC_DIR/build/anvil" "$BIN_TMP" || die "could not copy binary to ${TARGET}"
-# Atomic rename (not in-place cp): overwriting a downloaded binary in place
-# leaves a stale macOS provenance inode behind, which the kernel SIGKILLs on
-# exec (Killed: 9). rename() gives the target a fresh inode.
+
 ${PRIV}mv "$BIN_TMP" "$TARGET/anvil" || die "could not install binary to ${TARGET}/anvil"
 trap - EXIT
 ${PRIV}chmod +x "$TARGET/anvil"
@@ -205,8 +191,7 @@ log "Built and installed anvil -> ${TARGET}/anvil"
 choose_target() {
 if [ -n "$INSTALL_DIR" ]; then
     TARGET=$INSTALL_DIR
-    # Create/validate the target up front so the install step never hits a
-    # missing-directory mv failure deep in the flow.
+
     ensure_target_writable "$TARGET" || die "cannot write to install target ${TARGET}"
     return
 fi
@@ -235,7 +220,7 @@ esac
 main() {
 BUILD=0
 FORCE_NVIDIA=0
-# Preserve the externally-set ANVIL_BUILD env var (e.g. ANVIL_BUILD=1 curl ... | sh).
+
 [ -n "${ANVIL_BUILD:-}" ] && BUILD=1
 for _arg in "$@"; do
     case "$_arg" in

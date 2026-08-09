@@ -1,22 +1,3 @@
-/**
- * widechar_width.h for Unicode 17.0.0
- * See https://github.com/ridiculousfish/widecharwidth/
- *
- * SHA1 file hashes:
- *  (
- *  the hashes for generate.py and the template are git object hashes,
- *  use `git log --all --find-object=<hash>` in the widecharwidth repository
- *  to see which commit they correspond to,
- *  or run `git hash-object` on the file to compare.
- *  The other hashes are simple `sha1sum` style hashes.
- *  )
- *
- *  generate.py:         b35da43f176cc0d5880c67356ebb064048c5bac4
- *  template.js:         1249763c5b7c1e308aeb4ca64f1e15bce1fab9b3
- *  UnicodeData.txt:     50dffef1b7d1f97b72e4c2adceb9b2245f0f34ba
- *  EastAsianWidth.txt:  2cadc5034b6206ad84b75898a1d4186bb38fc12b
- *  emoji-data.txt:      3d123e12f70f63e609c4281ce83dfdd9ac7443d2
- */
 
 #ifndef WIDECHAR_WIDTH_H
 #define WIDECHAR_WIDTH_H
@@ -28,36 +9,31 @@
 
 namespace {
 
-/* Special width values */
 enum {
-  widechar_nonprint = -1,     // The character is not printable.
-  widechar_combining = -2,    // The character is a zero-width combiner.
-  widechar_ambiguous = -3,    // The character is East-Asian ambiguous width.
-  widechar_private_use = -4,  // The character is for private use.
-  widechar_unassigned = -5,   // The character is unassigned.
-  widechar_widened_in_9 = -6, // Width is 1 in Unicode 8, 2 in Unicode 9+.
-  widechar_non_character = -7 // The character is a noncharacter.
+  widechar_nonprint = -1,
+  widechar_combining = -2,
+  widechar_ambiguous = -3,
+  widechar_private_use = -4,
+  widechar_unassigned = -5,
+  widechar_widened_in_9 = -6,
+  widechar_non_character = -7
 };
 
-/* An inclusive range of characters. */
 struct widechar_range {
   uint32_t lo;
   uint32_t hi;
 };
 
-/* Simple ASCII characters - used a lot, so we check them first. */
 static const struct widechar_range widechar_ascii_table[] = {
     {0x00020, 0x0007E}
 };
 
-/* Private usage range. */
 static const struct widechar_range widechar_private_table[] = {
     {0x0E000, 0x0F8FF},
     {0xF0000, 0xFFFFD},
     {0x100000, 0x10FFFD}
 };
 
-/* Nonprinting characters. */
 static const struct widechar_range widechar_nonprint_table[] = {
     {0x00000, 0x0001F},
     {0x0007F, 0x0009F},
@@ -85,7 +61,6 @@ static const struct widechar_range widechar_nonprint_table[] = {
     {0xE0020, 0xE007F}
 };
 
-/* Width 0 combining marks. */
 static const struct widechar_range widechar_combining_table[] = {
     {0x00300, 0x0036F},
     {0x00483, 0x00489},
@@ -416,13 +391,11 @@ static const struct widechar_range widechar_combining_table[] = {
     {0xE0100, 0xE01EF}
 };
 
-/* Width 0 combining letters. */
 static const struct widechar_range widechar_combiningletters_table[] = {
     {0x01160, 0x011FF},
     {0x0D7B0, 0x0D7FF}
 };
 
-/* Width 2 characters. */
 static const struct widechar_range widechar_doublewide_table[] = {
     {0x01100, 0x0115F},
     {0x02329, 0x0232A},
@@ -500,7 +473,6 @@ static const struct widechar_range widechar_doublewide_table[] = {
     {0x30000, 0x3FFFD}
 };
 
-/* Ambiguous-width characters. */
 static const struct widechar_range widechar_ambiguous_table[] = {
     {0x000A1, 0x000A1},
     {0x000A4, 0x000A4},
@@ -683,7 +655,6 @@ static const struct widechar_range widechar_ambiguous_table[] = {
     {0x100000, 0x10FFFD}
 };
 
-/* Unassigned characters. */
 static const struct widechar_range widechar_unassigned_table[] = {
     {0x00378, 0x00379},
     {0x00380, 0x00383},
@@ -1443,7 +1414,6 @@ static const struct widechar_range widechar_unassigned_table[] = {
     {0xE01F0, 0xEFFFD}
 };
 
-/* Non-characters. */
 static const struct widechar_range widechar_nonchar_table[] = {
     {0x0FDD0, 0x0FDEF},
     {0x0FFFE, 0x0FFFF},
@@ -1465,7 +1435,6 @@ static const struct widechar_range widechar_nonchar_table[] = {
     {0x10FFFE, 0x10FFFF}
 };
 
-/* Characters that were widened from width 1 to 2 in Unicode 9. */
 static const struct widechar_range widechar_widened_table[] = {
     {0x0231A, 0x0231B},
     {0x023E9, 0x023EC},
@@ -1542,7 +1511,6 @@ bool widechar_in_table(const Collection &arr, uint32_t c) {
     return where != std::end(arr) && where->lo <= c;
 }
 
-/* Return the width of character c, or a special negative value. */
 int widechar_wcwidth(uint32_t c) {
     if (widechar_in_table(widechar_ascii_table, c))
         return 1;
@@ -1567,5 +1535,5 @@ int widechar_wcwidth(uint32_t c) {
     return 1;
 }
 
-} // namespace
-#endif // WIDECHAR_WIDTH_H
+}
+#endif
