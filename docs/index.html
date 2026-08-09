@@ -142,28 +142,6 @@ h2{font-family:var(--disp);font-weight:700;font-size:clamp(1.7rem,3.2vw,2.6rem);
 .chip.r{color:var(--red);border-color:rgba(255,92,61,.4);background:rgba(255,92,61,.08)}
 .bench-note{font-size:12px;color:var(--dim);margin-top:16px}
 .bench-note b{color:var(--muted);font-weight:500}
-.kv-wrap{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,3fr);gap:40px;align-items:start}
-.kv-presets{display:flex;flex-direction:column;gap:12px}
-.kv-btn{text-align:left;cursor:pointer;font-family:var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:8px;
-  padding:16px 18px;color:var(--text);transition:border-color .2s,transform .15s,box-shadow .2s,background .2s}
-.kv-btn:hover{border-color:var(--line2);transform:translateX(4px)}
-.kv-btn .nm{font-weight:700;font-size:14px;display:block;margin-bottom:3px}
-.kv-btn .ds{font-size:12px;color:var(--dim)}
-.kv-btn.active{border-color:var(--amber);background:var(--panel2);box-shadow:0 0 24px -8px rgba(255,157,46,.4)}
-.kv-btn.active .nm{color:var(--amber)} .kv-btn.active .ds{color:var(--muted)}
-.kv-viz{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:30px}
-.kv-cap{font-size:12px;color:var(--dim);margin-bottom:22px}
-.kv-cap b{color:var(--muted);font-weight:500}
-.gauge{position:relative;height:38px;background:#0d0903;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-bottom:8px}
-.gauge .fill{height:100%;width:24%;border-radius:5px 0 0 5px;background:linear-gradient(90deg,var(--hot),var(--amber));
-  box-shadow:0 0 22px rgba(255,157,46,.55);transition:width .7s cubic-bezier(.2,.8,.2,1),background .5s;position:relative}
-.gauge .fill::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 10px,rgba(0,0,0,.18) 10px 11px)}
-.gauge-scale{display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:30px}
-.kv-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.kv-stat{background:var(--panel2);padding:18px 20px}
-.kv-stat .v{font-family:var(--disp);font-weight:700;font-size:24px;transition:color .3s}
-.kv-stat .k{font-size:11px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-top:4px}
-#kv-gb{color:var(--amber)}#kv-x{color:var(--green)}#kv-loss{color:var(--pale)}
 .spec-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:48px;align-items:center}
 .tokline{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}
 .tok{width:44px;height:44px;border-radius:6px;display:flex;align-items:center;justify-content:center;
@@ -327,7 +305,7 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
 .reg-term .r-ctx{color:var(--amber)}
 .reg-term .r-cmd{color:var(--text);font-weight:700}
 @media(max-width:1000px){
-  .hero,.kv-wrap,.spec-grid,.tui-grid,.cfg-grid,.calc,.reg{grid-template-columns:1fr}
+  .hero,.spec-grid,.tui-grid,.cfg-grid,.reg{grid-template-columns:1fr}
   .backend-grid{grid-template-columns:repeat(3,1fr)}
   .cmds{grid-template-columns:repeat(2,1fr)}
   .use{grid-template-columns:60px 1fr}.use .ex{grid-column:2}
@@ -360,7 +338,6 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div class="links">
     <a href="#try">Try it</a>
     <a href="#bench">Benchmarks</a>
-    <a href="#kv">KV Cache</a>
     <a href="#turboquant">TurboQuant</a>
     <a href="#registry">Registry</a>
     <a href="#compare">Compare</a>
@@ -529,27 +506,6 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div class="papercite reveal">Source: <b>Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"</b>, Google Research · arXiv:<a href="https://arxiv.org/abs/2504.19874" target="_blank" rel="noopener">2504.19874</a>. NIAH figure = Fig. 4, LongBench = Table 1. Google's research blog reports <b>≥6× KV memory reduction</b> and <b>up to 8× speedup</b> computing attention logits on H100.</div>
 </section>
 <div class="divider"></div>
-<section id="kv">
-  <div class="reveal">
-    <div class="kicker">compress</div>
-    <h2>Compress the cache, not the conversation.</h2>
-    <p class="sub">TurboQuant rotates KV vectors into a Walsh–Hadamard basis, then applies per-coordinate Lloyd-Max codebooks — with a 1-bit residual pass for unbiased attention. The fork's <b>turbo3</b> type (3-bit) is the sweet spot: ~4.3× compression at ~1% quality cost. Pick a preset and watch the memory bill drop.</p>
-  </div>
-  <div class="kv-wrap reveal">
-    <div class="kv-presets" id="kv-presets"></div>
-    <div class="kv-viz">
-      <div class="kv-cap">KV cache footprint · <b>Qwen 3.6 27B</b> · 128K context · real architecture (64L · head_dim 256 · 4 KV heads)</div>
-      <div class="gauge"><div class="fill" id="kv-fill"></div></div>
-      <div class="gauge-scale"><span>0 GB</span><span>9 GB</span><span>18 GB</span><span>27 GB</span><span>36 GB</span></div>
-      <div class="kv-stats">
-        <div class="kv-stat"><div class="v" id="kv-gb">7.5 GB</div><div class="k">KV cache</div></div>
-        <div class="kv-stat"><div class="v" id="kv-x">4.6×</div><div class="k">compression</div></div>
-        <div class="kv-stat"><div class="v" id="kv-loss">~1%</div><div class="k">quality loss</div></div>
-      </div>
-    </div>
-  </div>
-</section>
-<div class="divider"></div>
 <section id="turboquant">
   <div class="reveal">
     <div class="kicker">quantize</div>
@@ -575,38 +531,6 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
     <div class="card" style="text-align:center"><div class="ct">2.5 bits</div><p>marginal degradation, ~2.5 GB for 128K on an 8B model</p></div>
     <div class="card" style="text-align:center"><div class="ct">≥6×</div><p>KV memory reduction per Google's research blog</p></div>
     <div class="card" style="text-align:center"><div class="ct">8×</div><p>attention-logit speedup vs f16 keys on H100 (4-bit)</p></div>
-  </div>
-  <div class="panel-box reveal">
-    <div class="pt">The memory equation</div>
-    <p style="margin-bottom:12px">For a model with <b>L</b> layers, <b>n</b> KV heads, and head dimension <b>h</b>, the f16 KV cache per token is:</p>
-    <pre class="formula">KV(token) = 2 × L × n × h × 2 bytes</pre>
-    <p style="margin-top:14px;margin-bottom:0">With TurboQuant the final <b>2 bytes</b> becomes <b>~0.44 bytes</b> (3.5 bits) — that's the 4.6× win, and it compounds directly with context length. Real head dimensions matter: Qwen 3.6 27B has head_dim 256 (not hidden_size/heads) — which is exactly what puts a 27B model’s KV cache at ~4 GB for 262K context under turbo compression.</p>
-  </div>
-</section>
-<div class="divider"></div>
-<section id="tuning">
-  <div class="reveal">
-    <div class="kicker">tune</div>
-    <h2>Squeeze the last token per second.</h2>
-    <p class="sub">VRAM is only half the battle. These are the knobs that actually move tokens-per-second once the model already fits.</p>
-  </div>
-  <div class="grid2 reveal">
-    <div class="card">
-      <div class="ct">Flash Attention</div>
-      <p>Always enable it. Flash Attention keeps the attention step memory-bound instead of compute-bound, and the larger your context the bigger the win.</p>
-    </div>
-    <div class="card">
-      <div class="ct">GPU Layers</div>
-      <p>Use <b>--ngl</b> to offload every layer that fits. Even one layer left on CPU creates a cross-bus bottleneck. The TUI shows the safe maximum.</p>
-    </div>
-    <div class="card">
-      <div class="ct">Context Right-Sizing</div>
-      <p>Don't pay for context you don't use. With TurboQuant the bill is 4-6× smaller — but a 27B model at 32K still costs half the KV of 64K.</p>
-    </div>
-    <div class="card">
-      <div class="ct">Speculative Decoding</div>
-      <p>MTP / NextN draft heads verify several tokens in parallel. On supported models (Gemma 4, Qwen 3.6 UDT) the fork measures <b>+30–50% short-prompt throughput</b> at ~85–88% accept rate.</p>
-    </div>
   </div>
   <div class="panel-box reveal">
     <div class="pt">Benchmark your own workload</div>
@@ -1055,7 +979,7 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     </div>
     <div class="col"><h4>Docs</h4>
       <a href="#bench">Benchmarks</a>
-      <a href="#kv">KV cache presets</a>
+      <a href="#turboquant">TurboQuant</a>
       <a href="#commands">REPL commands</a>
       <a href="#faq">FAQ</a>
     </div>
@@ -1193,34 +1117,6 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     busy=true;const v=inp.value;inp.value='';await handle(v);busy=false;inp.focus();});
   document.getElementById('play-term').addEventListener('click',()=>inp.focus());
   boot();
-})();
-
-(function(){
-  const PRESETS=[
-    {nm:'No Compress',  ds:'K=f16 · V=f16 · baseline',       gb:34.4, x:'1.0×', loss:'baseline', pct:100, col:'#ff5c3d'},
-    {nm:'Quality+',     ds:'K=q8_0 · V=turbo3 · ~2.9×',      gb:11.8, x:'2.9×', loss:'<1%',     pct:34,  col:'#ffc46b'},
-    {nm:'Recommended',  ds:'K=turbo4 · V=turbo3 · ~4.6×',    gb:7.5,  x:'4.6×', loss:'~1%',     pct:22,  col:'#5df0a2'},
-    {nm:'Max Compress', ds:'K=turbo4 · V=turbo2 · ~6×',      gb:5.9,  x:'5.8×', loss:'~3%',     pct:17,  col:'#ff9d2e'},
-  ];
-  const wrap=document.getElementById('kv-presets');
-  const fill=document.getElementById('kv-fill');
-  const elGb=document.getElementById('kv-gb'),elX=document.getElementById('kv-x'),elLoss=document.getElementById('kv-loss');
-  let cur=-1;
-  function countTo(el,val,suffix){
-    const from=parseFloat(el.dataset.v||val),t0=performance.now(),dur=500;el.dataset.v=val;
-    function step(t){const k=Math.min(1,(t-t0)/dur),e=1-Math.pow(1-k,3);
-      el.textContent=(from+(val-from)*e).toFixed(1)+suffix;if(k<1)requestAnimationFrame(step)}
-    requestAnimationFrame(step);}
-  function select(i){if(i===cur)return;cur=i;const p=PRESETS[i];
-    [...wrap.children].forEach((b,j)=>b.classList.toggle('active',j===i));
-    fill.style.width=p.pct+'%';
-    fill.style.background=`linear-gradient(90deg,#ff6a00,${p.col})`;
-    fill.style.boxShadow=`0 0 22px ${p.col}88`;
-    countTo(elGb,p.gb,' GB');elX.textContent=p.x;elLoss.textContent=p.loss;elGb.style.color=p.col;}
-  PRESETS.forEach((p,i)=>{const b=document.createElement('button');b.className='kv-btn';
-    b.innerHTML=`<span class="nm">${p.nm}</span><span class="ds">${p.ds} · ${p.gb} GB · ${p.loss} loss</span>`;
-    b.addEventListener('click',()=>select(i));wrap.appendChild(b);});
-  select(2);
 })();
 
 (function(){
