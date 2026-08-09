@@ -68,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.8";
+inline const char * ANVIL_VERSION = "0.4.9";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -295,6 +295,268 @@ struct Utf8Buffer {
     }
 };
 
+// ─── Streaming markdown renderer ──────────────────────────────────────────
+// Renders model output with ANSI styling as tokens stream in. Thinking
+// blocks (<thinking>…</thinking>, 〈think〉…〈/think〉, and variants) become
+// grey "collapsible-tag" blocks; **bold**, *italic*, ~~strike~~, `code`,
+// ```fences```, # headings and > quotes get terminal colors.
+//
+// Display-only: the caller still stores the raw text (markers and all) in
+// history. Markers can split across token boundaries ("<think" + "ing>"), so
+// a small lookahead holds back anything that could still extend into one.
+struct MarkdownStream {
+    std::string buf;                  // pending text (may end mid-marker)
+    bool in_think   = false;
+    bool in_fence   = false;
+    bool in_code    = false;
+    bool in_heading = false;
+    bool in_quote   = false;
+    bool bold       = false;
+    bool italic     = false;
+    bool strike     = false;
+    bool at_line_start = true;
+    char fence_char = 0;              // '`' or '~' for the open fence
+    char last_char  = 0;              // last emitted char (for *-italics lookahead)
+
+    static constexpr size_t HOLD_MAX = 12;   // longest marker prefix: "</thinking>"
+
+    // Complete 2+ char markers. When buf ends with one of these it is fully
+    // decidable — emitting all of it is safe (e.g. "<thinking>" ends in '>',
+    // which alone looks like a quote marker; holding it back would mangle the
+    // tag). Single-char markers ('*', '`') are excluded: they must still be
+    // held in case they extend into '**' or a fence.
+    static bool ends_with_complete_marker(const std::string & b) {
+        static const char * full[] = {
+            "<thinking>", "</thinking>", "<think>", "</think>",
+            "〈thinking〉", "〈/thinking〉", "〈think〉", "〈/think〉",
+            "```", "~~~", "**", "~~", "# ", "> ", "- ", "+ ", "1. ",
+        };
+        for (const char * m : full) {
+            const size_t n = std::strlen(m);
+            if (b.size() >= n && std::strncmp(b.c_str() + b.size() - n, m, n) == 0) return true;
+        }
+        return false;
+    }
+
+    // True when `suf` is a proper prefix of some marker (i.e. it might still
+    // extend into one once more input arrives).
+    static bool is_prefix_of_marker(const std::string & suf) {
+        static const char * markers[] = {
+            "<thinking>", "</thinking>", "<think>", "</think>",
+            "〈thinking〉", "〈/thinking〉", "〈think〉", "〈/think〉",
+            "```", "~~~", "**", "~~", "*", "`", "# ", "> ", "- ", "+ ", "1. ",
+        };
+        for (const char * m : markers) {
+            const size_t n = std::strlen(m);
+            if (n > suf.size() && std::strncmp(m, suf.c_str(), suf.size()) == 0) return true;
+        }
+        return false;
+    }
+
+    // Longest suffix of buf that could still extend into a marker. If buf
+    // ends with a complete marker, nothing needs holding (see above).
+    static size_t partial_suffix(const std::string & b) {
+        if (ends_with_complete_marker(b)) return 0;
+        const size_t lim = std::min(b.size(), HOLD_MAX);
+        for (size_t L = lim; L >= 1; L--) {
+            if (is_prefix_of_marker(b.substr(b.size() - L))) return L;
+        }
+        return 0;
+    }
+
+    static bool opening_think(const std::string & t, size_t i, size_t & len) {
+        static const char * tags[] = { "<thinking>", "〈thinking〉", "<think>", "〈think〉" };
+        for (const char * tag : tags) {
+            const size_t n = std::strlen(tag);
+            if (i + n <= t.size() && std::strncmp(tag, t.c_str() + i, n) == 0) { len = n; return true; }
+        }
+        return false;
+    }
+
+    static bool closing_think(const std::string & t, size_t i, size_t & len) {
+        static const char * tags[] = { "</thinking>", "〈/thinking〉", "</think>", "〈/think〉" };
+        for (const char * tag : tags) {
+            const size_t n = std::strlen(tag);
+            if (i + n <= t.size() && std::strncmp(tag, t.c_str() + i, n) == 0) { len = n; return true; }
+        }
+        return false;
+    }
+
+    // Reset and re-apply the active style set (so combinations compose).
+    void apply_style() {
+        printf("\033[0m");
+        if (in_think)   printf("\033[90m");        // grey thinking body
+        if (in_fence)   printf("\033[36m");        // cyan code block
+        if (in_code)    printf("\033[36m");        // cyan inline code
+        if (in_heading) printf("\033[1;33m");      // bold gold heading
+        if (in_quote)   printf("\033[2m");         // dim quote
+        if (bold)       printf("\033[1m");
+        if (italic)     printf("\033[3m");
+        if (strike)     printf("\033[9m");
+    }
+
+    void put(char c) {
+        fputc(c, stdout);
+        at_line_start = (c == '\n');
+        last_char = c;
+    }
+
+    void render(const std::string & t) {
+        const size_t n = t.size();
+        for (size_t i = 0; i < n; i++) {
+            const char c = t[i];
+
+            if (in_think) {
+                size_t cl = 0;
+                if (closing_think(t, i, cl)) {
+                    printf("\033[2;90m└─ /Thinking ─\033[0m\n");
+                    in_think = false;
+                    apply_style();
+                    i += cl - 1;
+                    at_line_start = true;
+                    continue;
+                }
+                put(c);
+                continue;
+            }
+            if (in_fence) {
+                if (at_line_start && i + 2 < n && t[i] == fence_char &&
+                    t[i + 1] == fence_char && t[i + 2] == fence_char) {
+                    in_fence = false;
+                    printf("\033[0m\n");
+                    i += 2;
+                    at_line_start = true;
+                    continue;
+                }
+                put(c);
+                continue;
+            }
+            if (in_code) {
+                if (c == '`') { in_code = false; apply_style(); continue; }
+                put(c);
+                continue;
+            }
+            if (in_heading) {
+                put(c);
+                if (c == '\n') { in_heading = false; apply_style(); }
+                continue;
+            }
+            if (in_quote) {
+                put(c);
+                if (c == '\n') { in_quote = false; apply_style(); }
+                continue;
+            }
+
+            if (c == '\n') { put(c); continue; }
+
+            if (at_line_start) {
+                // # heading (1-6 hashes followed by a space)
+                if (c == '#') {
+                    size_t h = 0;
+                    while (i + h < n && t[i + h] == '#' && h < 6) h++;
+                    if (i + h < n && t[i + h] == ' ') {
+                        in_heading = true;
+                        printf("\033[1;33m");
+                        i += h;              // hashes hidden; space stays
+                        continue;
+                    }
+                    put(c);
+                    continue;
+                }
+                // > blockquote
+                if (c == '>' && i + 1 < n && t[i + 1] == ' ') {
+                    in_quote = true;
+                    printf("\033[2m");
+                    continue;
+                }
+                // ``` / ~~~ fenced code
+                if ((c == '`' || c == '~') && i + 2 < n && t[i + 1] == c && t[i + 2] == c) {
+                    fence_char = c;
+                    in_fence = true;
+                    printf("\n\033[36m");
+                    i += 2;
+                    at_line_start = false;
+                    continue;
+                }
+                // - / + / * list bullets
+                if (i + 1 < n && t[i + 1] == ' ' && (c == '-' || c == '+' || c == '*')) {
+                    printf("\033[1;36m%c\033[0m", c);
+                    i += 1;
+                    at_line_start = false;
+                    continue;
+                }
+                // numbered lists
+                if (i + 1 < n && t[i + 1] == '.' &&
+                    std::isdigit(static_cast<unsigned char>(c))) {
+                    printf("\033[1;36m%c.\033[0m", c);
+                    i += 1;
+                    at_line_start = false;
+                    continue;
+                }
+            }
+
+            size_t tl = 0;
+            if (opening_think(t, i, tl)) {
+                if (!at_line_start) printf("\n");
+                printf("\033[2;90m┌─ Thinking ─\033[0m\n");
+                in_think = true;
+                apply_style();              // grey body
+                i += tl - 1;
+                at_line_start = false;
+                continue;
+            }
+            if (closing_think(t, i, tl)) {  // stray close tag: swallow it
+                i += tl - 1;
+                continue;
+            }
+
+            if (c == '*' && i + 1 < n && t[i + 1] == '*') {
+                bold = !bold; apply_style(); i += 1; continue;
+            }
+            if (c == '~' && i + 1 < n && t[i + 1] == '~') {
+                strike = !strike; apply_style(); i += 1; continue;
+            }
+            if (c == '`') { in_code = true; apply_style(); continue; }
+            if (c == '*') {
+                // italic unless space-delimited on both sides ("a * b" is a literal star).
+                // last_char spans chunk boundaries, so *italics* split across
+                // tokens still see the correct preceding character.
+                const bool prev_word = last_char != 0 &&
+                    !std::isspace(static_cast<unsigned char>(last_char));
+                const bool next_word = i + 1 < n &&
+                    !std::isspace(static_cast<unsigned char>(t[i + 1]));
+                if (prev_word || next_word) { italic = !italic; apply_style(); }
+                else put(c);
+                continue;
+            }
+            put(c);
+        }
+    }
+
+    void feed(const std::string & s) { buf += s; drain(); }
+
+    void drain(bool force = false) {
+        while (!buf.empty()) {
+            const size_t hold = force ? 0 : partial_suffix(buf);
+            if (hold == buf.size()) break;
+            const std::string text = buf.substr(0, buf.size() - hold);
+            buf.erase(0, text.size());
+            render(text);
+        }
+    }
+
+    void flush() {
+        drain(true);
+        if (in_think) printf("\033[2;90m└─ /Thinking ─\033[0m\n");
+        if (in_fence || in_code || in_heading || in_quote || bold || italic || strike) {
+            printf("\033[0m");
+        }
+        in_think = in_fence = in_code = in_heading = in_quote = bold = italic = strike = false;
+        at_line_start = true;
+        buf.clear();
+    }
+};
+
 struct ChatMessage {
     std::string role;
     std::string content;
@@ -350,7 +612,10 @@ struct CliArgs {
 };
 
 // Bounds applied to CLI numeric options (also used by config validation).
-inline constexpr int   MAX_CTX      = 1 << 22;   // 4M tokens sanity cap
+// Context has NO artificial cap: the only ceiling is the backend's position
+// type (llama_pos is int32_t), so INT32_MAX is the real limit. Memory is the
+// practical constraint and allocation fails naturally if a ctx is too big.
+inline constexpr int   MAX_CTX      = INT32_MAX;
 inline constexpr int   MAX_THREADS  = 1024;
 inline constexpr float MAX_TEMP     = 5.0f;
 inline constexpr int   MAX_TOP_K    = 100000;
@@ -1653,20 +1918,14 @@ int register_pulled(const std::string & friendly, const std::string & path,
     try {
         if (!params_json.empty()) apply_ollama_params(nlohmann::json::parse(params_json), e.profile);
     } catch (const nlohmann::json::exception &) {}
-    // Clamp a manifest-claimed num_ctx to the model's trained context: a
-    // Modelfile can request 131072 on a 4k-trained model, which would just
-    // waste KV memory (or fail to allocate). Also bounded by the global cap.
-    if (e.trained_ctx > 0) {
+    // A manifest-claimed num_ctx is honored as-is — no clamping to trained
+    // context or any other artificial cap. The user asked for it, the KV
+    // cache (TurboQuant-compressed) will allocate or fail naturally.
+    {
         auto it = e.profile.settings.find("n_ctx");
         if (it != e.profile.settings.end() && it->second.is_number_integer()) {
             const int64_t nctx = it->second.get<int64_t>();
-            const int64_t cap  = std::min<int64_t>(e.trained_ctx, MAX_CTX);
-            if (nctx > cap) {
-                fprintf(stderr, "\033[33mwarning: requested n_ctx=%lld exceeds trained context %lld; clamping to %lld\033[0m\n",
-                        static_cast<long long>(nctx), static_cast<long long>(e.trained_ctx),
-                        static_cast<long long>(cap));
-                it->second = cap;
-            }
+            if (nctx > MAX_CTX) it->second = static_cast<int64_t>(MAX_CTX);  // type ceiling only
         }
     }
     seed_model_profile(e.profile, e.trained_ctx, e.gguf_meta);
@@ -2449,7 +2708,8 @@ AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
 
     // Context options: powers of two up to the model's trained context.
     std::vector<int> ctx_options;
-    for (int c = 1; c > 0 && c <= max_ctx && c <= INT32_MAX / 2; c *= 2) {
+    for (int c = 1; c > 0 && c <= max_ctx; c *= 2) {
+        if (c > INT32_MAX / 2) break;   // stop before c *= 2 would overflow
         ctx_options.push_back(c);
     }
     ctx_options.push_back(0);  // "Custom..."
@@ -2797,7 +3057,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = static_cast<uint32_t>(cfg.n_ctx);
-    cparams.n_batch   = cparams.n_ctx;
+    cparams.n_batch   = cparams.n_ctx;    // logical batch == ctx: no batching caps.
+    // n_ubatch stays at the backend default (512): it sizes the compute-graph
+    // scratch, which must NOT scale with ctx (GBs at 262k) — TurboQuant only
+    // compresses the KV cache. Setting ubatch=n_ctx makes huge contexts fail
+    // to allocate graph buffers, which is exactly the OOM trap we avoid.
     cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
     cparams.flash_attn_type = cfg.flash_attn
         ? LLAMA_FLASH_ATTN_TYPE_ENABLED
@@ -2911,7 +3175,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    // Generation loop over the currently decoded state.
+    // Generation loop over the currently decoded state. Streaming output is
+    // routed through the markdown renderer (thinking tags, bold/italic/code,
+    // headings, quotes, fences); the raw text still goes into `response` so
+    // history and /export keep the unfiltered markdown.
+    MarkdownStream md;
     auto generate = [&](std::string & response, GenStats & stats) -> bool {
         llama_sampler_reset(smpl.get());
         const auto gen_start = std::chrono::steady_clock::now();
@@ -2935,7 +3203,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             const std::string piece = token_to_str(vocab, id);
             const std::string printable = utf8_buf.feed(piece);
             if (!printable.empty()) {
-                printf("%s", printable.c_str());
+                md.feed(printable);
                 fflush(stdout);
             }
             response += piece;
@@ -2952,9 +3220,10 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         }
         const std::string tail = utf8_buf.flush();
         if (!tail.empty()) {
-            printf("%s", tail.c_str());
+            md.feed(tail);
             fflush(stdout);
         }
+        md.flush();
         stats.elapsed_sec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - gen_start).count();
         return decode_ok;
@@ -3032,8 +3301,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             return false;   // old context untouched
         }
         // Init into a local; only swap in once it is valid.
-        cparams.n_ctx   = new_ctx;
-        cparams.n_batch = new_ctx;
+        cparams.n_ctx    = new_ctx;
+        cparams.n_batch  = new_ctx;   // logical batch follows ctx (n_ubatch stays 512)
         LlamaContext new_ctx_obj(llama_init_from_model(model, cparams));
         if (!new_ctx_obj) {
             fprintf(stderr, "\033[31merror: failed to recreate context at %u tokens\033[0m\n", new_ctx);
@@ -3187,7 +3456,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             if (user_input.rfind("/ctx ", 0) == 0) {
                 int new_ctx = 0;
                 if (!parse_int(user_input.substr(5), new_ctx) || new_ctx < 1 || new_ctx > MAX_CTX) {
-                    printf("Invalid context size (1..%d).\n\n", MAX_CTX);
+                    printf("Invalid context size (positive integer, no artificial cap).\n\n");
                     continue;
                 }
                 if (static_cast<uint32_t>(new_ctx) == cparams.n_ctx) {
@@ -3229,21 +3498,19 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 raw_toks.insert(raw_toks.end(), extra.begin(), extra.end());
                 if (!decode_tokens(raw_toks)) continue;
                 prev_tokens = extra;
-                printf("\033[33m");
                 std::string resp;
                 GenStats stats;
                 generate(resp, stats);
-                printf("\n\033[0m");
+                printf("\n");
                 finish_turn(resp);
                 continue;
             }
             if (!start_turn(formatted)) continue;
 
-            printf("\033[33m");
             std::string resp;
             GenStats stats;
             generate(resp, stats);
-            printf("\n\033[0m");
+            printf("\n");
             if (stats.tokens_generated > 0) {
                 fprintf(stderr, "  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
                         stats.tokens_generated, stats.tps(), stats.elapsed_sec);
@@ -3272,11 +3539,10 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         if (!decode_tokens(full)) return 1;
         prev_tokens = std::move(all);
 
-        printf("\033[33m");
         std::string resp;
         GenStats stats;
         generate(resp, stats);
-        printf("\n\033[0m");
+        printf("\n");
         if (stats.tokens_generated > 0) {
             fprintf(stderr, "\n  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
                     stats.tokens_generated, stats.tps(), stats.elapsed_sec);
