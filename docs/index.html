@@ -354,15 +354,15 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
   <div>
     <div class="tag">anvil run qwen3.6-27b.gguf --ctx 131072</div>
     <h1>FORGE<br><span class="hot">ANYTHING.</span></h1>
-    <p class="lede">A terminal-native LLM client built on <b>TurboQuant</b> — the Google Research KV-cache compression algorithm. Up to <b>6.4× smaller cache</b> with quality-neutral 3.5-bit quantization. No cloud. No API keys. No telemetry.</p>
+    <p class="lede">A terminal-native LLM client built on <b>TurboQuant</b> — the Google Research KV-cache compression algorithm behind the paper’s benchmark tables below. No cloud. No API keys. No telemetry.</p>
     <div class="installbox">
       <span class="dollar">$</span>
       <code id="install-cmd">curl -fsSL https://anvil-llm.github.io/anvil/install.sh | sh</code>
       <button class="copybtn" data-copy="#install-cmd">copy</button>
     </div>
     <div class="statstrip">
-      <div class="st"><div class="num">6.4×</div><div class="lbl">max KV compression</div></div>
-      <div class="st"><div class="num">0.997</div><div class="lbl">NIAH recall = full precision</div></div>
+      <div class="st"><div class="num">TurboQuant</div><div class="lbl">Google Research KV cache</div></div>
+      <div class="st"><div class="num">MTP+NextN</div><div class="lbl">speculative decoding</div></div>
       <div class="st"><div class="num">0</div><div class="lbl">cloud calls</div></div>
     </div>
   </div>
@@ -526,11 +526,10 @@ footer{border-top:1px solid var(--line);background:var(--bg2);padding:56px 32px 
       <p>MSE quantizers bias attention. TurboQuant adds a <b>1-bit Quantized Johnson-Lindenstrauss (QJL)</b> pass on the residual, making inner products <b>unbiased</b> — the reason accuracy survives at 3.5 bits.</p>
     </div>
   </div>
-  <div class="reveal" style="margin-top:40px;display:grid;grid-template-columns:repeat(4,1fr);gap:14px">
-    <div class="card" style="text-align:center"><div class="ct">3.5 bits</div><p>quality-neutral per the paper — <b>50.06 = 50.06</b> on LongBench</p></div>
-    <div class="card" style="text-align:center"><div class="ct">2.5 bits</div><p>marginal degradation, ~2.5 GB for 128K on an 8B model</p></div>
-    <div class="card" style="text-align:center"><div class="ct">≥6×</div><p>KV memory reduction per Google's research blog</p></div>
-    <div class="card" style="text-align:center"><div class="ct">8×</div><p>attention-logit speedup vs f16 keys on H100 (4-bit)</p></div>
+  <div class="reveal" style="margin-top:40px;display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
+    <div class="card" style="text-align:center"><div class="ct">Data-oblivious</div><p>No calibration, no training, no per-model tuning — the codebooks are precomputed and universal.</p></div>
+    <div class="card" style="text-align:center"><div class="ct">Accelerator-native</div><p>Backend kernels for CUDA, Metal (TurboFlash), Vulkan and HIP — quantization is free at decode time.</p></div>
+    <div class="card" style="text-align:center"><div class="ct">Peer-reviewed</div><p>Google Research paper with proofs of near-optimality — the benchmark tables below are straight from it.</p></div>
   </div>
   <div class="panel-box reveal">
     <div class="pt">Benchmark your own workload</div>
@@ -654,12 +653,12 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891 · KV: turbo4/tur
   <div class="reg reveal">
     <div class="reg-term">
       <div class="r-cmd">$ anvil list</div>
-      <div class="r-out">  <span class="r-name">qwen3.6-27b</span>    <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">128K</span>  <span class="r-size">17.9 GB</span></div>
-      <div class="r-out">  <span class="r-name">lfm2.5-2.6b</span>     <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">128K</span>  <span class="r-size">1.9 GB</span></div>
-      <div class="r-out">  <span class="r-name">bonsai-27b</span>       <span class="r-kv">turbo3/turbo3</span>  <span class="r-ctx">262K</span>  <span class="r-size">3.8 GB</span></div>
+      <div class="r-out">  <span class="r-name">qwen3.6-27b</span>    <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">262K</span></div>
+      <div class="r-out">  <span class="r-name">lfm2.5-2.6b</span>     <span class="r-kv">turbo4/turbo3</span>  <span class="r-ctx">128K</span></div>
+      <div class="r-out">  <span class="r-name">bonsai-27b</span>       <span class="r-kv">turbo3/turbo3</span>  <span class="r-ctx">262K</span></div>
       <div class="r-cmd">$ anvil pull qwen3.6-27b</div>
       <div class="r-out">  resolving qwen3.6-27b from ollama registry…</div>
-      <div class="r-out">  ✓ downloaded · 17.9 GB · sha256 verified</div>
+      <div class="r-out">  ✓ downloaded · sha256 verified</div>
       <div class="r-cmd">$ anvil run qwen3.6-27b</div>
       <div class="r-kv">  KV : K=turbo4 V=turbo3   ctx : 128000 tokens   flash : on</div>
     </div>
@@ -802,7 +801,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891 · KV: turbo4/tur
     </div>
     <div class="use">
       <div class="n">02</div>
-      <div><h3>Long-document research</h3><p>TurboQuant's 4-6× KV compression means whole papers and codebases fit in context on a single GPU.</p></div>
+      <div><h3>Long-document research</h3><p>TurboQuant’s KV compression means whole papers and codebases fit in context on a single GPU.</p></div>
       <div class="ex">anvil run model.gguf --ctx 131072 --type-k turbo4 --type-v turbo3</div>
     </div>
     <div class="use">
@@ -827,7 +826,7 @@ tokens/sec: 127.4 · prompt tokens: 842 · total tokens: 4 891 · KV: turbo4/tur
     <div class="qa"><button>Is TurboQuant actually a Google paper?<span class="pm">+</span></button>
       <div class="a"><p>Yes. <b>TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate</b> is by Amir Zandieh, Majid Daliri, Majid Hadian and Vahab Mirrokni (Google Research / Google DeepMind / NYU), arXiv <b>2504.19874</b>. It proves near-optimal distortion — within ≈2.7× of the Shannon lower bound — and shows quality-neutral KV compression at 3.5 bits. The anvil fork implements the WHT-rotated family (turbo2/3/4) with backend-native kernels.</p></div></div>
     <div class="qa"><button>What's the real compression number?<span class="pm">+</span></button>
-      <div class="a"><p>The fork's measured factors vs f16: <b>turbo2 ≈ 6.4×</b>, <b>turbo3 ≈ 4.3×</b> (the fork's recommended default), <b>turbo4 ≈ 3.8×</b>. The paper reports compression exceeding <b>5×</b>; Google's blog says the KV memory is reduced <b>≥6×</b>. anvil's default K=turbo4/V=turbo3 lands around 4.2× with ~1% quality cost.</p></div></div>
+      <div class="a"><p>anvil ships the WHT-rotated TurboQuant family (2/3/4-bit K and V cache types, selectable per side). How much memory you save depends on your model and context — see the benchmark tables above from the Google Research paper (arXiv:2504.19874), which show TurboQuant matching the full-precision cache on LongBench and needle-in-a-haystack.</p></div></div>
     <div class="qa"><button>Do I need a GPU?<span class="pm">+</span></button>
       <div class="a"><p>No — anvil runs on CPU with AVX2/NEON. But with a GPU it auto-offloads layers, and TurboQuant's KV compression means <b>even modest VRAM fits long contexts</b>. An RTX 3060 12GB is a perfectly good anvil.</p></div></div>
     <div class="qa"><button>What models work?<span class="pm">+</span></button>
@@ -1010,7 +1009,7 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
 })();
 
 (function(){
-  const items=['TurboQuant KV','6.4× compression','3.5-bit quality neutral','MTP speculative decoding','NextN','Flash Attention','WHT rotation','CUDA','Vulkan','Metal','ROCm','CPU','GGUF','GBNF grammars','model registry','single binary','zero telemetry','arXiv:2504.19874'];
+  const items=['TurboQuant KV cache','MTP speculative decoding','NextN','Flash Attention','WHT rotation','CUDA','Vulkan','Metal','ROCm','CPU','GGUF','GBNF grammars','model registry','single binary','zero telemetry','arXiv:2504.19874'];
   const html=items.map(t=>`<span>${t}</span><b>⚒</b>`).join('');
   document.getElementById('ticker-track').innerHTML=html+html;
 })();
@@ -1026,7 +1025,7 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
 ░██    ░██ ░██    ░██  ░██  ░██  ░██░██
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██`;
-  const STREAM="The key-value cache stores a vector for every token you've seen. TurboQuant first rotates each vector with a Walsh-Hadamard transform so no single coordinate dominates, then quantizes with per-coordinate codebooks designed to hit the information-theoretic optimum. A 1-bit residual pass keeps attention unbiased — which is why 3.5-bit caches score identically to full precision.";
+  const STREAM="The key-value cache stores a vector for every token you've seen. TurboQuant first rotates each vector with a Walsh-Hadamard transform so no single coordinate dominates, then quantizes with per-coordinate codebooks designed to hit the information-theoretic optimum. A 1-bit residual pass keeps attention unbiased — which is why the compressed cache scores identically to full precision in the paper’s benchmarks.";
   const SEQ=[
     {t:'cmd', s:'anvil run qwen3.6-27b.gguf --ctx 131072'},
     {t:'out', s:'Hardware: AMD Ryzen 9 7950X | x86_64 | 64 GB RAM | 32 threads'},
@@ -1076,7 +1075,7 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
   let busy=false,ri=0;
   const responses=[
-    "The KV cache stores a key and value vector for every token seen so far. TurboQuant rotates them with a Walsh-Hadamard transform, then quantizes each coordinate with Lloyd-Max codebooks and a 1-bit residual pass — so they take about 4-6x less VRAM with no measurable accuracy loss.",
+    "The KV cache stores a key and value vector for every token seen so far. TurboQuant rotates them with a Walsh-Hadamard transform, then quantizes each coordinate with Lloyd-Max codebooks and a 1-bit residual pass — so long contexts fit in far less memory with no measurable accuracy loss.",
     "I run entirely on your machine. No API keys, no network, no telemetry — just weights on your GPU and a hammer.",
     "Try /stats to see tokens per second, /ctx to check context fill, or anvil list to see your model registry. Everything stays local."
   ];
@@ -1104,9 +1103,9 @@ CUDA · Vulkan · Metal · ROCm · SYCL · CPU</pre>
     if(c==='/model'){line('pl-out','  arch       : qwen3_5');line('pl-out','  trained ctx: 262144');line('pl-out','  ngl        : 99');return}
     if(c==='/ctx'){line('pl-ctx','  ctx [███████░░░░░░░░░░░░░░░░░░░░░] 6.4% (8412/131072)');return}
     if(c.startsWith('/temp')){line('pl-out','Temperature set to '+(c.split(' ')[1]||'0.8')+' — saved to profile');return}
-    if(c==='anvil list'){line('pl-out','  qwen3.6-27b    turbo4/turbo3  128K  17.9 GB');
-      line('pl-out','  lfm2.5-2.6b     turbo4/turbo3  128K  1.9 GB');
-      line('pl-out','  bonsai-27b      turbo3/turbo3  262K  3.8 GB');return}
+    if(c==='anvil list'){line('pl-out','  qwen3.6-27b    turbo4/turbo3  262K');
+      line('pl-out','  lfm2.5-2.6b     turbo4/turbo3  128K');
+      line('pl-out','  bonsai-27b      turbo3/turbo3  262K');return}
     if(c.startsWith('anvil pull')){line('pl-out','  resolving '+(c.split(' ')[2]||'model')+' …');line('pl-out','  ✓ downloaded · sha256 verified');return}
     if(c.startsWith('anvil run')){await boot();return}
     const r=responses[ri++%responses.length];
