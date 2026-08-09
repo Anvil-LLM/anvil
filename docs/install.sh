@@ -71,7 +71,34 @@ log "Verifying checksum..."
 # The tag endpoint lists every asset with its sha256 digest. Collapse the JSON
 # to one line, then pull the digest belonging to our asset name.
 _meta=$(http_get_stdout "${API_URL}/tags/${TAG}" 2>/dev/null | tr -d '\n')
-_digest=$(printf '%s' "$_meta" | sed -n "s/.*\"name\"[[:space:]]*:[[:space:]]*\"${_asset}\"[^}]*\"digest\"[[:space:]]*:[[:space:]]*\"sha256:\([^\"]*\)\".*/\1/p" | head -1)
+# Asset JSON contains a nested "uploader" object, so a naive [^}]* regex can
+# never reach "digest" - parse it properly with python3/jq when available.
+_digest=""
+if has_cmd python3; then
+    _digest=$(printf '%s' "$_meta" | ANVIL_ASSET="$_asset" python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+target = os.environ.get("ANVIL_ASSET", "")
+for a in d.get("assets", []):
+    if a.get("name") == target:
+        dig = a.get("digest") or ""
+        if dig.startswith("sha256:"):
+            sys.stdout.write(dig[len("sha256:"):])
+        break
+' 2>/dev/null)
+fi
+if [ -z "$_digest" ] && has_cmd jq; then
+    _digest=$(printf '%s' "$_meta" | jq -r --arg n "$_asset" '.assets[] | select(.name == $n) | .digest' 2>/dev/null | sed 's/^sha256://' | head -1)
+fi
+if [ -z "$_digest" ]; then
+    # Last-resort regex. BSD grep caps interval repetition at 255, so the
+    # window between the asset name and its digest (spans the nested uploader
+    # object) is matched as 4 x {0,150} instead of {0,600}.
+    _digest=$(printf '%s' "$_meta" | grep -oE "\"name\"[[:space:]]*:[[:space:]]*\"${_asset}\".{0,150}.{0,150}.{0,150}.{0,150}\"digest\"[[:space:]]*:[[:space:]]*\"sha256:[0-9a-f]{64}\"" | head -1 | sed 's/.*sha256://; s/"$//')
+fi
 if [ -z "$_digest" ]; then log "warning: no checksum available for ${_asset}; skipping verification"; return 0; fi
 if has_cmd sha256sum; then _actual=$(sha256sum "$_file" | awk '{print $1}')
 elif has_cmd shasum; then _actual=$(shasum -a 256 "$_file" | awk '{print $1}')
@@ -93,6 +120,13 @@ for _asset in ${CUDA_ASSET:-} "$ASSET"; do
         log "  ${_asset} unavailable at ${TAG}; trying fallback"
         continue
     fi
+    # curl/wget never preserve the exec bit; without this the --version probe
+    # below fails with "Permission denied" on EVERY platform and the installer
+    # wrongly reports "does not run on this system".
+    chmod +x "$TMP_BIN" 2>/dev/null || {
+        log "  could not execute ${_asset}; trying fallback"
+        continue
+    }
     if ! verify_checksum "$TMP_BIN" "$_asset"; then
         log "  checksum failed for ${_asset}; trying fallback"
         continue

@@ -65,8 +65,10 @@ for a in "$@"; do
 done
 if [ -n "$out" ]; then
     # A runnable dummy anvil: install.sh executes it via "$TMP_BIN" --version.
+    # Deliberately NO chmod: real curl/wget never preserve exec bits, and
+    # install.sh must chmod +x itself — this is what caught the "does not run
+    # on this system" bug that a chmod'd stub would have masked.
     printf '#!/bin/sh\ncase "$1" in --version) echo "anvil v9.9.9 (fake)"; exit 0 ;; *) exit 0 ;; esac\n' > "$out"
-    chmod +x "$out"
     exit 0
 fi
 case "$url" in
@@ -187,8 +189,8 @@ for a in "$@"; do
 done
 if [ -n "$out" ]; then
     printf '%s' "$url" | grep -q -- '-cuda' && exit 1
+    # No chmod, matching real curl — install.sh must chmod +x before probing.
     printf '#!/bin/sh\ncase "$1" in --version) echo "anvil v9.9.9 (fake)"; exit 0 ;; *) exit 0 ;; esac\n' > "$out"
-    chmod +x "$out"
     exit 0
 fi
 echo '{"tag_name":"v9.9.9"}'

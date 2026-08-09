@@ -44,7 +44,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(anvil PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
 endif()
 if(APPLE)
-target_link_libraries(anvil PRIVATE "-framework Metal" "-framework Foundation" "-framework Accelerate" "-framework QuartzCore" "-framework CoreFoundation" "-framework IOKit" "-lc++" "-lobjc")
+# clang++ links libc++ automatically; passing -lc++ again makes the linker
+# warn "ignoring duplicate libraries".
+target_link_libraries(anvil PRIVATE "-framework Metal" "-framework Foundation" "-framework Accelerate" "-framework QuartzCore" "-framework CoreFoundation" "-framework IOKit" "-lobjc")
 elseif(UNIX)
 target_link_libraries(anvil PRIVATE pthread dl m)
 endif()

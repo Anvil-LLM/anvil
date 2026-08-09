@@ -12,6 +12,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -67,7 +68,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██ 
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.4.0";
+inline const char * ANVIL_VERSION = "0.4.2";
 inline const int    CONFIG_VERSION = 2;
 
 // ─── Global state ──────────────────────────────────────────────────────────
@@ -1137,7 +1138,14 @@ int cmd_rm(const std::vector<std::string> & args) {
 }
 
 int cmd_models(const std::vector<std::string> & args) {
-    if (args.empty()) {
+    // `list` is an alias for the default listing; the subcommand error below
+    // advertises it, so it must actually work. Trailing args are rejected to
+    // match the strictness of the other subcommands.
+    if (args.size() > 1 && args[0] == "list") {
+        fprintf(stderr, "error: unexpected argument '%s'\n", args[1].c_str());
+        return 1;
+    }
+    if (args.empty() || args[0] == "list") {
         const std::vector<ModelEntry> models = load_models();
         if (models.empty()) {
             printf("No models registered.\n");
@@ -1154,6 +1162,11 @@ int cmd_models(const std::vector<std::string> & args) {
             printf("%-26s %-12s %-10s %-10s %s\n", m.name.c_str(), m.source.c_str(),
                    format_size(m.size_bytes).c_str(), trained, m.path.c_str());
         }
+        return 0;
+    }
+
+    if (args[0] == "--help" || args[0] == "-h") {
+        printf("usage: anvil models [list] | import <file.gguf> [--name <name>] | rm <name> [--yes]\n");
         return 0;
     }
 
@@ -1331,6 +1344,40 @@ bool valid_registry_component(const std::string & s) {
     return true;
 }
 
+// Validates an OCI/registry blob digest (sha256:<64 hex>). Digests come from
+// remote manifests but are embedded into shell-quoted curl URLs below, so
+// anything outside that shape is rejected before it can reach a shell.
+bool valid_digest(const std::string & s) {
+    if (s.compare(0, 7, "sha256:") != 0) return false;
+    const std::string hex = s.substr(7);
+    if (hex.size() != 64) return false;
+    for (const char ch : hex) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+// The HF API "sha" is a git commit SHA-1 (40 hex chars). It is embedded into
+// download URLs below, so only well-formed values are accepted.
+bool valid_hf_sha(const std::string & s) {
+    if (s.size() != 40) return false;
+    for (const char ch : s) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+// HF file paths go into shell-quoted download URLs; restrict them to the same
+// safe charset as registry components.
+bool valid_hf_filename(const std::string & s) {
+    if (s.empty() || s.size() > 256) return false;
+    for (const char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (!(std::isalnum(c) || c == '.' || c == '-' || c == '_')) return false;
+    }
+    return true;
+}
+
 // Unique temp path for capturing command output (portable, no mkstemp).
 std::string pull_tmp_path() {
     static std::atomic<unsigned> counter{0};
@@ -1438,6 +1485,18 @@ bool parse_ollama_manifest(const std::string & json, OllamaManifest & out) {
             if (l.contains("mediaType")) layer.media_type = l["mediaType"].get<std::string>();
             if (l.contains("digest"))    layer.digest    = l["digest"].get<std::string>();
             if (l.contains("size"))      layer.size      = l["size"].get<uint64_t>();
+            // Layer digests are embedded into shell-quoted curl URLs later.
+            // Accept only sha256:<64 hex>, lowercased: OCI digests are
+            // canonically lowercase, and ollama-local blob files are stored
+            // on disk as sha256-<lowercase hex>, so any other spelling would
+            // fail validation here, break the blob-path lookup, or reach the
+            // shell. Malformed metadata layers are skipped rather than failing
+            // the whole manifest; the caller still hard-requires the model
+            // layer (the only one whose digest is indispensable).
+            std::string digest = layer.digest;
+            for (char & c : digest) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!valid_digest(digest)) continue;
+            layer.digest = std::move(digest);
             out.layers.push_back(std::move(layer));
         }
         return !out.layers.empty();
@@ -1660,8 +1719,8 @@ bool resolve_hf_sha(const std::string & repo, std::string & sha) {
     try {
         const nlohmann::json j = nlohmann::json::parse(body);
         if (j.contains("sha") && j["sha"].is_string()) {
-            sha = j["sha"].get<std::string>();
-            return !sha.empty();
+            const std::string s = j["sha"].get<std::string>();
+            if (valid_hf_sha(s)) { sha = s; return true; }
         }
     } catch (const nlohmann::json::exception &) {}
     return false;
@@ -1694,6 +1753,7 @@ bool list_hf_files(const std::string & repo, const std::string & sha,
         try { p = f["path"].get<std::string>(); } catch (const nlohmann::json::exception &) { continue; }
         if (p.size() < 5 || p.compare(p.size() - 5, 5, ".gguf") != 0) continue;
         if (p.find('/') != std::string::npos) continue;   // top-level only
+        if (!valid_hf_filename(p)) continue;              // reject shell-hostile names
         HfFile hf;
         hf.path = p;
         if (f.contains("size") && f["size"].is_number()) {
@@ -1833,10 +1893,16 @@ int cmd_pull_hf(const std::string & spec, const std::vector<std::string> & extra
 
     const std::string url = "https://huggingface.co/" + repo + "/resolve/" + sha + "/" + chosen->path;
     printf("Downloading %s (%s)...\n", chosen->path.c_str(), format_size(chosen->size).c_str());
+    // The LFS oid is embedded into a verified download; require sha256:<64 hex>.
+    std::string digest;
     if (chosen->oid.empty()) {
         fprintf(stderr, "\033[33mwarning: no sha256 available from the HF API; download will not be verified\033[0m\n");
+    } else if (valid_digest("sha256:" + chosen->oid)) {
+        digest = "sha256:" + chosen->oid;
+    } else {
+        fprintf(stderr, "\033[33mwarning: malformed LFS oid for %s; download will not be verified\033[0m\n",
+                chosen->path.c_str());
     }
-    const std::string digest = chosen->oid.empty() ? "" : "sha256:" + chosen->oid;
     if (download_verified(url, model_path, chosen->size, digest) != 0) return 1;
 
     return register_pulled(friendly, model_path, "hf", source_id, "", "", "");
@@ -2289,9 +2355,14 @@ AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx);
 
 
 AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
+    // Unknown model context (setup-only mode, or a header-less model): cap the
+    // option menu at a sane ceiling and default to 4096 instead of presenting
+    // a bare "Custom..." choice.
+    const bool known_ctx = max_ctx > 0;
+    if (max_ctx <= 0) max_ctx = 131072;
     AnvilConfig cfg;
     cfg.ngl = derive_ngl(hw);
-    cfg.n_ctx = max_ctx > 0 ? max_ctx : 0;
+    cfg.n_ctx = known_ctx ? max_ctx : 4096;
 
     // Context options: powers of two up to the model's trained context.
     std::vector<int> ctx_options;
@@ -3045,7 +3116,9 @@ int main(int argc, char ** argv) {
     if (cli.sub == "rm")      return cmd_rm(cli.sub_args);
     if (cli.sub == "pull")    return cmd_pull(cli.sub_args);
 
-    if (cli.model.empty()) {
+    // `anvil --setup` is the one invocation allowed without a model: it
+    // re-runs the hardware/setup TUI and saves the config.
+    if (cli.model.empty() && !cli.setup) {
         fprintf(stderr, "error: no model specified\n\n");
         print_usage();
         return 1;
@@ -3054,29 +3127,33 @@ int main(int argc, char ** argv) {
     // Resolve a friendly registry name or a local file path.
     std::string resolved_path;
     std::string friendly;
-    if (!resolve_model_arg(cli.model, resolved_path, friendly)) {
-        fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
-                cli.model.c_str());
-        fprintf(stderr, "  Try: anvil pull ollama:%s | anvil pull hf:<repo> | anvil models import <file.gguf> --name %s\n",
-                cli.model.c_str(), cli.model.c_str());
-        return 1;
-    }
-    cli.model = resolved_path;
-    if (friendly.empty()) {
-        // Local file: derive a friendly name for the registry.
-        friendly = slugify(std::filesystem::path(cli.model).stem().string());
-    }
-    cli.friendly = friendly;
+    if (!cli.model.empty()) {
+        if (!resolve_model_arg(cli.model, resolved_path, friendly)) {
+            fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
+                    cli.model.c_str());
+            fprintf(stderr, "  Try: anvil pull ollama:%s | anvil pull hf:<repo> | anvil models import <file.gguf> --name %s\n",
+                    cli.model.c_str(), cli.model.c_str());
+            return 1;
+        }
+        cli.model = resolved_path;
+        if (friendly.empty()) {
+            // Local file: derive a friendly name for the registry.
+            friendly = slugify(std::filesystem::path(cli.model).stem().string());
+        }
+        cli.friendly = friendly;
 
-    if (!validate_gguf(cli.model)) {
-        fprintf(stderr, "\033[31merror: '%s' is not a valid GGUF file\033[0m\n", cli.model.c_str());
-        return 1;
+        if (!validate_gguf(cli.model)) {
+            fprintf(stderr, "\033[31merror: '%s' is not a valid GGUF file\033[0m\n", cli.model.c_str());
+            return 1;
+        }
     }
 
     const HWInfo hw = probe_hw();
 
     // Read GGUF header metadata (vocab only) for context defaults + registry.
-    const ModelMeta meta = read_model_meta(cli.model);
+    // Skipped in setup-only mode (no model to inspect).
+    ModelMeta meta;
+    if (!cli.model.empty()) meta = read_model_meta(cli.model);
     const int max_ctx = static_cast<int>(meta.trained_ctx);
 
     LlamaBackend backend;
@@ -3087,6 +3164,11 @@ int main(int argc, char ** argv) {
         cfg.model = cli.model;
         write_config(cfg);
         fprintf(stderr, "\nConfig saved to %s\n", config_path().c_str());
+        if (cli.model.empty()) {
+            // `anvil --setup` without a model: probe + save only.
+            fprintf(stderr, "Hardware probe complete. Run 'anvil <model>' to start a session.\n");
+            return 0;
+        }
     } else {
         cfg = load_config();
     }
