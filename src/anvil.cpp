@@ -61,7 +61,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.5.1";
+inline const char * ANVIL_VERSION = "0.5.2";
 inline const int    CONFIG_VERSION = 2;
 
 inline std::atomic<bool> g_interrupted{false};

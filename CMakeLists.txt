@@ -43,6 +43,7 @@ set_target_properties(mdtty PROPERTIES
     CXX_STANDARD_REQUIRED ON
     C_STANDARD 11
 )
+target_compile_definitions(mdtty PRIVATE UTF8PROC_STATIC)
 target_include_directories(mdtty PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mdtty/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mdtty/src
