@@ -3962,8 +3962,66 @@ struct RagIndex {
     std::vector<RagChunk> chunks;
     std::map<std::string, double> idf;
     std::map<std::string, std::vector<size_t>> postings;
+    std::vector<std::string> sources;
     bool empty() const { return chunks.empty(); }
     size_t size() const { return chunks.size(); }
+
+    void rebuild_idf() {
+        idf.clear();
+        if (chunks.empty()) return;
+        for (const auto & [t, ps] : postings) {
+            const double df = static_cast<double>(ps.size());
+            idf[t] = std::log(static_cast<double>(chunks.size()) / (1.0 + df)) + 1.0;
+        }
+    }
+
+    bool add_source(const std::string & text, const std::string & source) {
+        const size_t before = chunks.size();
+        add_text(text);
+        if (chunks.size() == before) return false;
+        sources.push_back(source);
+        rebuild_idf();
+        return true;
+    }
+
+    bool add_file(const std::string & path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (content.size() > (8 << 20)) content.resize(8 << 20);
+        return add_source(content, path);
+    }
+
+    bool add_url(const std::string & url) {
+        httplib::Client cli(url);
+        cli.set_follow_location(true);
+        cli.set_connection_timeout(15, 0);
+        cli.set_read_timeout(30, 0);
+        auto res = cli.Get("/");
+        if (!res || res->status != 200) return false;
+        std::string body = res->body;
+        std::string stripped;
+        bool in_tag = false;
+        for (const char c : body) {
+            if (c == '<') { in_tag = true; continue; }
+            if (c == '>') { in_tag = false; stripped += ' '; continue; }
+            if (!in_tag) stripped += c;
+        }
+        std::string clean;
+        bool prev_space = false;
+        for (const char c : stripped) {
+            if (c == '\r' || c == '\t') continue;
+            if (c == '\n' || c == ' ') {
+                if (prev_space) continue;
+                prev_space = true;
+                clean += ' ';
+            } else {
+                prev_space = false;
+                clean += c;
+            }
+        }
+        return add_source(clean, url);
+    }
 
     static std::vector<std::string> tokenize(const std::string & s) {
         std::vector<std::string> out;
@@ -4026,14 +4084,12 @@ struct RagIndex {
             if (!in) continue;
             std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (content.size() > (8 << 20)) content.resize(8 << 20);
+            const size_t before = chunks.size();
             add_text(content);
+            if (chunks.size() > before) sources.push_back(f);
         }
-        if (chunks.empty()) return false;
-        for (const auto & [t, ps] : postings) {
-            const double df = static_cast<double>(ps.size());
-            idf[t] = std::log(static_cast<double>(chunks.size()) / (1.0 + df)) + 1.0;
-        }
-        return true;
+        rebuild_idf();
+        return !chunks.empty();
     }
 
     std::vector<size_t> search(const std::string & query, size_t k) const {
@@ -5112,15 +5168,15 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         fprintf(stderr, "  vision     : \033[32mready\033[0m\n");
     }
 
-    RagIndex rag;
+    RagIndex session_rag;
     if (!cli.rag_dir.empty()) {
         fprintf(stderr, "Indexing RAG corpus: %s ...\n", cli.rag_dir.c_str());
-        if (!rag.build_dir(cli.rag_dir)) {
+        if (!session_rag.build_dir(cli.rag_dir)) {
             fprintf(stderr, "\033[33mwarning: no indexable text files in %s; RAG disabled\033[0m\n",
                     cli.rag_dir.c_str());
         } else {
             fprintf(stderr, "  rag        : \033[32m%d chunk(s) indexed\033[0m\n",
-                    static_cast<int>(rag.size()));
+                    static_cast<int>(session_rag.size()));
         }
     }
 
@@ -5550,11 +5606,92 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
+    auto summarize_quiet = [&](const std::string & prompt, std::string & out) -> bool {
+        std::vector<llama_token> toks = tokenize_render(vocab, prompt);
+        if (toks.empty()) return false;
+        llama_memory_clear(mem, true);
+        prev_tokens.clear();
+        if (!decode_tokens(toks)) return false;
+        prev_tokens = std::move(toks);
+        AnvilConfig sum_cfg = cfg;
+        sum_cfg.temp = 0.3f;
+        LlamaSampler sum_smpl(build_sampler_chain(vocab, sum_cfg, false, "", 42));
+        if (!sum_smpl) return false;
+        llama_sampler_reset(sum_smpl.get());
+        std::string acc;
+        int n = 0;
+        while (n < 800) {
+            const int32_t used = llama_memory_seq_pos_max(mem, 0) + 1;
+            if (used >= static_cast<int32_t>(llama_n_ctx(ctx))) break;
+            const llama_token id = llama_sampler_sample(sum_smpl.get(), ctx, -1);
+            if (llama_vocab_is_eog(vocab, id)) break;
+            acc += token_to_str(vocab, id);
+            n++;
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+            if (llama_decode(ctx, batch) != 0) break;
+        }
+        out = acc;
+        return !out.empty();
+    };
+
+    auto compact_history = [&]() -> bool {
+        if (history.size() <= 6) return false;
+        std::string sys;
+        size_t first_keep = 0;
+        for (size_t i = 0; i < history.size(); i++) {
+            if (history[i].role == "system") {
+                sys = history[i].content;
+                first_keep = i + 1;
+            }
+        }
+        if (first_keep >= history.size()) return false;
+        const size_t keep_from = history.size() > 6 ? history.size() - 5 : first_keep + 1;
+        if (keep_from <= first_keep) return false;
+        std::string dump;
+        for (size_t i = first_keep; i < keep_from; i++) {
+            const auto & m = history[i];
+            const char * tag = m.role == "assistant" ? "Assistant"
+                             : m.role == "tool" ? "Tool result" : "User";
+            dump += std::string(tag) + ": " + m.content + "\n";
+        }
+        if (dump.size() < 64) return false;
+        const std::string prompt =
+            "Summarize this conversation into one concise paragraph. Preserve every concrete fact, number, decision, and open task. Omit greetings and small talk.\n\n" +
+            dump + "\nSummary:";
+        std::string summary;
+        if (!summarize_quiet(prompt, summary)) return false;
+        if (summary.size() > 2400) summary.resize(2400);
+        std::vector<ChatMessage> kept;
+        if (!sys.empty()) {
+            kept.push_back({"system", sys, ""});
+        }
+        kept.push_back({"system", "[Summary of earlier conversation]\n" + summary, ""});
+        for (size_t i = keep_from; i < history.size(); i++) kept.push_back(history[i]);
+        history = std::move(kept);
+        llama_memory_clear(mem, true);
+        prev_tokens.clear();
+        fprintf(stderr, "\n\033[1;36m── Context compacted ──\033[0m\n");
+        fprintf(stderr, "  summary : %zu chars\n  kept    : %zu message(s)\n\n",
+                summary.size(), history.size());
+        save_session(session_path_str, history);
+        return true;
+    };
+
     if (cli.prompt.empty()) {
 
         while (true) {
             g_interrupted = 0;
-            const int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
+            int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
+            const uint32_t n_ctx_total = llama_n_ctx(ctx);
+            if (n_ctx_used > 0 && n_ctx_total > 0 &&
+                static_cast<double>(n_ctx_used) / n_ctx_total > 0.75 &&
+                history.size() > 6) {
+                if (!compact_history()) {
+                    fprintf(stderr, "\033[33m⚠ context at %d/%u; compaction unavailable\033[0m\n",
+                            n_ctx_used, static_cast<int>(n_ctx_total));
+                }
+                n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
+            }
             if (n_ctx_used > 0) print_ctx_bar(n_ctx_used, static_cast<int>(llama_n_ctx(ctx)));
             printf("\033[32m> \033[0m");
             fflush(stdout);
@@ -5675,6 +5812,45 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
             if (user_input == "/image") {
                 printf("Usage: /image <path>\n\n");
+                continue;
+            }
+
+            if (user_input == "/ingest clear") {
+                session_rag.chunks.clear();
+                session_rag.idf.clear();
+                session_rag.postings.clear();
+                session_rag.sources.clear();
+                printf("Session index cleared.\n\n");
+                continue;
+            }
+            if (user_input == "/ingest") {
+                printf("Session index: %zu chunk(s) from %zu source(s)\n\n",
+                       session_rag.size(), session_rag.sources.size());
+                for (const auto & s : session_rag.sources) printf("  - %s\n", s.c_str());
+                printf("\nUsage: /ingest <file|dir|url>\n\n");
+                continue;
+            }
+            if (user_input.rfind("/ingest ", 0) == 0) {
+                const std::string target = expand_home(user_input.substr(8));
+                bool ok = false;
+                if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) {
+                    printf("Fetching %s ...\n", target.c_str());
+                    fflush(stdout);
+                    ok = session_rag.add_url(target);
+                } else if (std::filesystem::is_directory(target)) {
+                    ok = session_rag.build_dir(target);
+                } else if (std::filesystem::is_regular_file(target)) {
+                    ok = session_rag.add_file(target);
+                } else {
+                    printf("No such file or directory: %s\n\n", target.c_str());
+                    continue;
+                }
+                if (ok) {
+                    printf("Indexed %s — %zu chunk(s), %zu source(s).\n\n",
+                           target.c_str(), session_rag.size(), session_rag.sources.size());
+                } else {
+                    printf("Nothing indexable found in %s\n\n", target.c_str());
+                }
                 continue;
             }
 
@@ -5851,8 +6027,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
             std::string user_msg = user_input;
             std::string rag_ctx;
-            if (!cli.rag_dir.empty() && !rag.empty()) {
-                rag_ctx = rag.context_for(user_input, 3);
+            if (!session_rag.empty()) {
+                rag_ctx = session_rag.context_for(user_input, 3);
                 if (!rag_ctx.empty()) {
                     user_msg = "Relevant context:\n\n" + rag_ctx + "Question: " + user_input;
                 }
