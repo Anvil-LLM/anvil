@@ -13,7 +13,7 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
 set(LLAMA_INSTALL_VERSION 0.0.1 CACHE STRING "" FORCE)
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 if(NOT DEFINED GGML_METAL)
@@ -35,6 +35,9 @@ FetchContent_Declare(ftxui GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXU
 set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ftxui)
+
+FetchContent_Declare(httplib GIT_REPOSITORY https://github.com/yhirose/cpp-httplib GIT_TAG v0.53.0 GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(httplib)
 
 add_library(mdtty STATIC
     third_party/mdtty/src/mdtty.cpp
@@ -61,11 +64,11 @@ endif()
 add_executable(anvil
     src/anvil.cpp
 )
-target_include_directories(anvil PRIVATE src ${LLAMA_DIR}/include ${LLAMA_DIR}/ggml/include ${LLAMA_DIR}/tools/mtmd)
+target_include_directories(anvil PRIVATE src ${LLAMA_DIR}/include ${LLAMA_DIR}/ggml/include ${LLAMA_DIR}/tools/mtmd ${LLAMA_DIR}/common)
 
 target_include_directories(anvil PRIVATE SYSTEM ${LLAMA_DIR}/vendor)
 add_subdirectory(${LLAMA_DIR}/tools/mtmd ${CMAKE_BINARY_DIR}/mtmd-build EXCLUDE_FROM_ALL)
-target_link_libraries(anvil PRIVATE llama ggml ftxui::ftxui mdtty mtmd)
+target_link_libraries(anvil PRIVATE llama llama-common ggml ftxui::ftxui mdtty mtmd httplib::httplib)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(anvil PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
 endif()

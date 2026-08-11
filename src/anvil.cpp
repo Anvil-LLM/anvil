@@ -62,6 +62,8 @@
 #include <cinttypes>
 #include <map>
 #include <nlohmann/json.hpp>
+#include "httplib.h"
+#include "chat.h"
 
 inline const char * ANVIL_LOGO = R"(
    ░███                          ░██░██
@@ -237,6 +239,7 @@ struct AnvilConfig {
     float     repeat_penalty = 1.1f;
     bool      flash_attn = true;
     bool      mtp        = false;
+    int       seed       = -1;
     ggml_type type_k     = GGML_TYPE_Q8_0;
     ggml_type type_v     = GGML_TYPE_TURBO3_0;
     std::string model;
@@ -633,6 +636,7 @@ struct CliArgs {
     std::string rag_dir;
     std::string image;
     std::string token;
+    std::string api_key;
     int         max_tokens  = -1;
     int         port        = 8080;
     std::string host        = "127.0.0.1";
@@ -2911,316 +2915,696 @@ typedef int anvil_sock_t;
 #define ANVIL_SOCK_ERR (-1)
 #endif
 
-static bool sock_init() {
-#ifdef _WIN32
-    WSADATA wsa;
-    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
-#else
-    return true;
-#endif
-}
+static std::string g_serve_api_key;
+static std::mutex g_serve_infer_lock;
 
-static void sock_shutdown() {
-#ifdef _WIN32
-    WSACleanup();
-#endif
-}
-
-static anvil_sock_t sock_listen(const std::string & host, int port) {
-#ifdef _WIN32
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return ANVIL_SOCK_INVALID;
-    BOOL one = TRUE;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one), sizeof(one));
-#else
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return ANVIL_SOCK_INVALID;
-    int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#endif
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (host.empty() || host == "0.0.0.0") {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else {
-        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-    }
-    if (bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-        ANVIL_SOCK_CLOSE(s);
-        return ANVIL_SOCK_INVALID;
-    }
-    if (listen(s, 16) != 0) {
-        ANVIL_SOCK_CLOSE(s);
-        return ANVIL_SOCK_INVALID;
-    }
-    return s;
-}
-
-static void sock_send(anvil_sock_t c, const std::string & data) {
-#ifdef _WIN32
-    send(c, data.data(), static_cast<int>(data.size()), 0);
-#else
-    size_t off = 0;
-    while (off < data.size()) {
-        const ssize_t n = ::send(c, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-        if (n <= 0) break;
-        off += static_cast<size_t>(n);
-    }
-#endif
-}
-
-static std::string sock_read_until(anvil_sock_t c, const std::string & term, size_t max) {
-    std::string buf;
-    char tmp[4096];
-    while (buf.size() < max) {
-        const int n = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
-        if (n <= 0) break;
-        buf.append(tmp, static_cast<size_t>(n));
-        if (buf.find(term) != std::string::npos) break;
-    }
-    return buf;
-}
-
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string body;
-    std::map<std::string, std::string> headers;
-};
-
-static bool parse_http_request(anvil_sock_t c, HttpRequest & req) {
-    const std::string head = sock_read_until(c, "\r\n\r\n", 1 << 20);
-    if (head.empty()) return false;
-    const size_t hdr_end = head.find("\r\n\r\n");
-    if (hdr_end == std::string::npos) return false;
-    const std::string header_block = head.substr(0, hdr_end);
-    std::istringstream hs(header_block);
-    std::string line;
-    std::getline(hs, line);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    const size_t sp1 = line.find(' ');
-    const size_t sp2 = line.rfind(' ');
-    if (sp1 == std::string::npos || sp2 == std::string::npos || sp2 <= sp1) return false;
-    req.method = line.substr(0, sp1);
-    req.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
-    while (std::getline(hs, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::string k = line.substr(0, colon);
-        std::string v = line.substr(colon + 1);
-        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
-        for (char & ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        req.headers[k] = v;
-    }
-    const auto it = req.headers.find("content-length");
-    size_t clen = 0;
-    if (it != req.headers.end()) {
-        char * end = nullptr;
-        const unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
-        if (end != it->second.c_str() && v < (1ULL << 30)) clen = static_cast<size_t>(v);
-    }
-    if (clen > 0) {
-        size_t have = head.size() > hdr_end + 4 ? head.size() - hdr_end - 4 : 0;
-        req.body = head.substr(hdr_end + 4);
-        while (req.body.size() < clen) {
-            char tmp[4096];
-            const int n = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
-            if (n <= 0) break;
-            req.body.append(tmp, static_cast<size_t>(n));
-        }
-        req.body.resize(clen);
-        (void)have;
-    }
-    return true;
-}
-
-static std::string http_status_line(int code) {
-    switch (code) {
-        case 200: return "HTTP/1.1 200 OK";
-        case 400: return "HTTP/1.1 400 Bad Request";
-        case 404: return "HTTP/1.1 404 Not Found";
-        case 405: return "HTTP/1.1 405 Method Not Allowed";
-        case 500: return "HTTP/1.1 500 Internal Server Error";
-        case 503: return "HTTP/1.1 503 Service Unavailable";
-        default:  return "HTTP/1.1 500 Internal Server Error";
-    }
-}
-
-static void http_reply(anvil_sock_t c, int code, const std::string & ctype,
-                       const std::string & body, bool cors) {
-    std::string out = http_status_line(code) + "\r\n";
-    out += "Content-Type: " + ctype + "\r\n";
-    out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    out += "Access-Control-Allow-Origin: *\r\n";
-    out += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-    out += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
-    out += "Cache-Control: no-store\r\n";
-    out += "Connection: close\r\n\r\n";
-    out += body;
-    (void)cors;
-    sock_send(c, out);
-}
-
-static void http_reply_sse(anvil_sock_t c, const std::string & event) {
-    std::string out = "data: " + event + "\n\n";
-    sock_send(c, out);
-}
+static std::string token_to_str(const llama_vocab * vocab, llama_token token);
+static llama_sampler * build_sampler_chain(const llama_vocab * vocab, const AnvilConfig & cfg,
+        bool grammar_active, const std::string & grammar_src, int seed = -1);
+static std::vector<llama_token> tokenize_render(const llama_vocab * vocab, const std::string & text);
 
 static int64_t now_unix() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-static std::string token_to_str(const llama_vocab * vocab, llama_token token);
-static llama_sampler * build_sampler_chain(const llama_vocab * vocab, const AnvilConfig & cfg,
-        bool grammar_active, const std::string & grammar_src);
-static std::vector<llama_token> tokenize_render(const llama_vocab * vocab, const std::string & text);
+static std::string serve_id(const char * prefix) {
+    static std::atomic<uint64_t> counter{0};
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s%llx%llx",
+                  prefix,
+                  static_cast<unsigned long long>(now_unix()),
+                  static_cast<unsigned long long>(counter.fetch_add(1)));
+    return std::string(buf);
+}
 
-static bool complete_stream(anvil_sock_t c, llama_context * ctx, llama_model * model,
-                            const llama_vocab * vocab, llama_sampler * smpl,
-                            llama_memory_t mem, const std::vector<ChatMessage> & history,
-                            const char * tmpl, bool add_bos, llama_token bos_id,
-                            int max_tokens, std::string & out_text, GenStats & stats,
-                            const volatile sig_atomic_t & stop) {
-    std::vector<llama_chat_message> msgs;
-    msgs.reserve(history.size());
-    for (const auto & m : history) msgs.push_back({m.role.c_str(), m.content.c_str()});
-    int32_t n = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true, nullptr, 0);
-    if (n < 0) return false;
-    std::string formatted(static_cast<size_t>(n) + 1, '\0');
-    const int32_t m = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
-                                                formatted.data(), static_cast<int32_t>(formatted.size()));
-    if (m < 0) return false;
-    formatted.resize(static_cast<size_t>(m));
-    std::vector<llama_token> toks = tokenize_render(vocab, formatted);
-    if (toks.empty()) return false;
-    std::vector<llama_token> full;
-    full.reserve(toks.size() + 1);
-    if (add_bos && (toks.empty() || toks[0] != bos_id)) full.push_back(bos_id);
-    full.insert(full.end(), toks.begin(), toks.end());
+static std::vector<llama_token> serve_tokenize(const llama_vocab * vocab, const std::string & text, bool parse_special) {
+    int32_t n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
+                               nullptr, 0, false, parse_special);
+    if (n == INT32_MIN) return {};
+    if (n < 0) n = -n;
+    if (n <= 0) return {};
+    std::vector<llama_token> toks(static_cast<size_t>(n));
+    const int32_t m = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
+                                     toks.data(), n, false, parse_special);
+    if (m < 0) return {};
+    toks.resize(static_cast<size_t>(m));
+    return toks;
+}
+
+static bool serve_decode_all(llama_context * ctx, const std::vector<llama_token> & toks) {
     const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
-    for (size_t i = 0; i < full.size(); i += static_cast<size_t>(chunk)) {
-        const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - i);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + i),
+    for (size_t i = 0; i < toks.size(); i += static_cast<size_t>(chunk)) {
+        const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), toks.size() - i);
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(toks.data() + i),
                                                 static_cast<int32_t>(nn));
         if (llama_decode(ctx, batch) != 0) return false;
     }
-    llama_sampler_reset(smpl);
-    Utf8Buffer ub;
-    const auto t0 = std::chrono::steady_clock::now();
-    while (true) {
-        if (stop) break;
-        if (max_tokens > 0 && stats.tokens_generated >= max_tokens) break;
-        const llama_token id = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(vocab, id)) break;
-        const std::string piece = token_to_str(vocab, id);
-        const std::string printable = ub.feed(piece);
-        if (!printable.empty()) {
-            out_text += printable;
-            nlohmann::json j;
-            j["id"] = "chatcmpl-anvil";
-            j["object"] = "chat.completion.chunk";
-            j["created"] = now_unix();
-            j["model"] = "anvil";
-            j["choices"] = nlohmann::json::array();
-            nlohmann::json ch;
-            ch["index"] = 0;
-            ch["delta"] = {{"content", printable}};
-            ch["finish_reason"] = nullptr;
-            j["choices"].push_back(ch);
-            http_reply_sse(c, j.dump());
+    return true;
+}
+
+struct ServeGenCtx {
+    llama_context * ctx = nullptr;
+    llama_model * model = nullptr;
+    const llama_vocab * vocab = nullptr;
+    llama_memory_t mem = nullptr;
+    common_chat_templates * tmpls = nullptr;
+    AnvilConfig cfg;
+    std::string model_id;
+};
+
+struct ServeResult {
+    common_chat_msg msg;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    std::string finish_reason = "stop";
+};
+
+static std::string serve_tool_choice(const nlohmann::ordered_json & body) {
+    if (!body.contains("tool_choice") || body["tool_choice"].is_null()) return "auto";
+    const auto & tc = body["tool_choice"];
+    if (tc.is_string()) return tc.get<std::string>();
+    if (tc.is_object()) {
+        const std::string type = tc.value("type", std::string("auto"));
+        if (type == "any" || type == "tool") return "required";
+        return type;
+    }
+    return "auto";
+}
+
+static bool serve_chat(ServeGenCtx & g, const nlohmann::ordered_json & body,
+                       const std::function<bool(const common_chat_msg_diff &)> & emit,
+                       ServeResult & out, std::string & err,
+                       const volatile sig_atomic_t & stop,
+                       const std::function<void(int)> & on_prompt = {}) {
+    common_chat_templates_inputs inputs;
+    std::string generated;
+    try {
+        if (!body.contains("messages") || !body["messages"].is_array()) {
+            err = "messages is required";
+            return false;
         }
-        stats.tokens_generated++;
-        llama_sampler_accept(smpl, id);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
-        if (llama_decode(ctx, batch) != 0) return false;
+        inputs.messages = common_chat_msgs_parse_oaicompat(body["messages"]);
+        if (inputs.messages.empty()) {
+            err = "messages is empty";
+            return false;
+        }
+        for (const auto & m : inputs.messages) {
+            if (m.contains_media()) {
+                err = "image content is not supported in serve yet";
+                return false;
+            }
+        }
+        if (body.contains("tools") && body["tools"].is_array()) {
+            inputs.tools = common_chat_tools_parse_oaicompat(body["tools"]);
+        }
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(serve_tool_choice(body));
+        if (body.contains("response_format") && body["response_format"].is_object()) {
+            const auto & rf = body["response_format"];
+            const std::string type = rf.value("type", std::string());
+            if (type == "json_object") {
+                inputs.json_schema = "{}";
+            } else if (type == "json_schema" && rf.contains("json_schema")) {
+                const auto & js = rf["json_schema"];
+                inputs.json_schema = js.contains("schema") ? js["schema"].dump() : js.dump();
+            }
+        }
+        if (body.contains("grammar")) inputs.grammar = body["grammar"].get<std::string>();
+        inputs.parallel_tool_calls = body.value("parallel_tool_calls", true);
+        inputs.enable_thinking = body.value("enable_thinking", true);
+        const std::string rf_name = body.value("reasoning_format", std::string("auto"));
+        inputs.reasoning_format = common_reasoning_format_from_name(rf_name);
+        const auto chat_params = common_chat_templates_apply(g.tmpls, inputs);
+        if (chat_params.prompt.empty()) {
+            err = "chat template produced an empty prompt";
+            return false;
+        }
+        std::vector<llama_token> toks = serve_tokenize(g.vocab, chat_params.prompt, true);
+        if (toks.empty()) {
+            err = "prompt tokenization failed";
+            return false;
+        }
+        if (!serve_decode_all(g.ctx, toks)) {
+            err = "prompt decode failed";
+            return false;
+        }
+        out.prompt_tokens = static_cast<int>(toks.size());
+        if (on_prompt) on_prompt(out.prompt_tokens);
+
+        AnvilConfig cfg = g.cfg;
+        if (body.contains("temperature") && body["temperature"].is_number()) cfg.temp = body["temperature"].get<float>();
+        if (body.contains("top_p") && body["top_p"].is_number()) cfg.top_p = body["top_p"].get<float>();
+        if (body.contains("top_k") && body["top_k"].is_number_integer()) cfg.top_k = body["top_k"].get<int>();
+        if (body.contains("seed") && body["seed"].is_number_integer()) cfg.seed = body["seed"].get<int>();
+        if (body.contains("repeat_penalty") && body["repeat_penalty"].is_number()) cfg.repeat_penalty = body["repeat_penalty"].get<float>();
+
+        LlamaSampler smpl(build_sampler_chain(g.vocab, cfg, false, "", cfg.seed));
+        if (!smpl) {
+            err = "sampler init failed";
+            return false;
+        }
+        llama_sampler * gs = nullptr;
+        if (!chat_params.grammar.empty()) {
+            if (chat_params.grammar_lazy) {
+                std::vector<std::string> trigger_patterns;
+                std::vector<llama_token> trigger_tokens;
+                for (const auto & trigger : chat_params.grammar_triggers) {
+                    switch (trigger.type) {
+                        case COMMON_GRAMMAR_TRIGGER_TYPE_WORD: {
+                            trigger_patterns.push_back(regex_escape(trigger.value));
+                            break;
+                        }
+                        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN: {
+                            trigger_patterns.push_back(trigger.value);
+                            break;
+                        }
+                        case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+                            const auto & pattern = trigger.value;
+                            std::string anchored = "^$";
+                            if (!pattern.empty()) {
+                                anchored = (pattern.front() != '^' ? "^" : "")
+                                    + pattern
+                                    + (pattern.back() != '$' ? "$" : "");
+                            }
+                            trigger_patterns.push_back(anchored);
+                            break;
+                        }
+                        case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN: {
+                            trigger_tokens.push_back(trigger.token);
+                            break;
+                        }
+                    }
+                }
+                std::vector<const char *> trigger_patterns_c;
+                trigger_patterns_c.reserve(trigger_patterns.size());
+                for (const auto & regex : trigger_patterns) trigger_patterns_c.push_back(regex.c_str());
+                gs = llama_sampler_init_grammar_lazy_patterns(g.vocab, chat_params.grammar.c_str(), "root",
+                        trigger_patterns_c.data(), trigger_patterns_c.size(),
+                        trigger_tokens.data(), trigger_tokens.size());
+            } else {
+                gs = llama_sampler_init_grammar(g.vocab, chat_params.grammar.c_str(), "root");
+            }
+        }
+        LlamaSampler gs_guard(gs);
+        llama_sampler_reset(smpl.get());
+        bool grammar_alive = gs != nullptr;
+        if (gs && !chat_params.grammar_lazy) {
+            const auto prefill = serve_tokenize(g.vocab, chat_params.generation_prompt, true);
+            for (const auto & t : prefill) {
+                try { llama_sampler_accept(gs, t); }
+                catch (...) { break; }
+            }
+        }
+        std::vector<llama_token_data> cand;
+        cand.reserve(static_cast<size_t>(llama_vocab_n_tokens(g.vocab)));
+
+        std::vector<std::string> stops;
+        if (body.contains("stop")) {
+            const auto & s = body["stop"];
+            if (s.is_string()) stops.push_back(s.get<std::string>());
+            else if (s.is_array()) {
+                for (const auto & x : s) if (x.is_string()) stops.push_back(x.get<std::string>());
+            }
+        }
+        for (const auto & s : chat_params.additional_stops) stops.push_back(s);
+
+        const int max_tokens = body.value("max_tokens", body.value("max_completion_tokens", -1));
+        std::set<llama_token> preserved;
+        for (const auto & s : chat_params.preserved_tokens) {
+            const auto ptoks = serve_tokenize(g.vocab, s, true);
+            if (!ptoks.empty()) preserved.insert(ptoks[0]);
+        }
+
+        common_chat_parser_params pparams(chat_params);
+        pparams.parse_tool_calls = !inputs.tools.empty();
+        if (!chat_params.parser.empty()) pparams.parser.load(chat_params.parser);
+
+        common_chat_msg msg_prv;
+        std::vector<std::string> ids_cache;
+        auto gen_id = []() { return serve_id("call_"); };
+
+        std::set<size_t> sent_tool_names;
+        auto apply_diffs = [&](bool is_partial) {
+            const auto new_msg = common_chat_parse(generated, is_partial, pparams);
+            if (new_msg.empty() || new_msg == msg_prv) return;
+            common_chat_msg nxt = new_msg;
+            nxt.set_tool_call_ids(ids_cache, gen_id);
+            if (!emit) {
+                msg_prv = nxt;
+                return;
+            }
+            const auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv, nxt);
+            msg_prv = nxt;
+            for (auto d : all_diffs) {
+                if (d.tool_call_index != std::string::npos) {
+                    const size_t i = d.tool_call_index;
+                    if (i < msg_prv.tool_calls.size() && !msg_prv.tool_calls[i].name.empty() &&
+                        !sent_tool_names.count(i) && (d.tool_call_index != i || !d.tool_call_delta.arguments.empty())) {
+                        common_chat_msg_diff header;
+                        header.tool_call_index = static_cast<size_t>(i);
+                        header.tool_call_delta.id = msg_prv.tool_calls[i].id;
+                        header.tool_call_delta.name = msg_prv.tool_calls[i].name;
+                        if (!emit(header)) return;
+                        sent_tool_names.insert(i);
+                    }
+                    if (sent_tool_names.count(i)) d.tool_call_delta.name = "";
+                }
+                if (!emit(d)) return;
+            }
+        };
+
+        bool length_hit = false;
+        bool stop_hit = false;
+        while (true) {
+            if (stop) break;
+            if (max_tokens > 0 && out.completion_tokens >= max_tokens) {
+                length_hit = true;
+                break;
+            }
+            const float * logits = llama_get_logits_ith(g.ctx, -1);
+            if (!logits) { err = "logits unavailable"; return false; }
+            const int32_t n_vocab = llama_vocab_n_tokens(g.vocab);
+            cand.resize(static_cast<size_t>(n_vocab));
+            for (llama_token i = 0; i < n_vocab; i++) {
+                cand[static_cast<size_t>(i)] = { i, logits[i], 0.0f };
+            }
+            llama_token_data_array cur_p = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(smpl.get(), &cur_p);
+            if (cur_p.selected < 0) { err = "sampling produced no token"; return false; }
+            llama_token id = cur_p.data[cur_p.selected].id;
+            if (gs && grammar_alive) {
+                llama_token_data single = { id, 1.0f, 0.0f };
+                llama_token_data_array single_arr = { &single, 1, -1, false };
+                llama_sampler_apply(gs, &single_arr);
+                if (single_arr.data[0].logit == -INFINITY) {
+                    cand.resize(static_cast<size_t>(n_vocab));
+                    for (llama_token i = 0; i < n_vocab; i++) {
+                        cand[static_cast<size_t>(i)] = { i, logits[i], 0.0f };
+                    }
+                    cur_p = { cand.data(), cand.size(), -1, false };
+                    llama_sampler_apply(gs, &cur_p);
+                    llama_sampler_apply(smpl.get(), &cur_p);
+                    if (cur_p.selected < 0) { err = "sampling produced no token"; return false; }
+                    id = cur_p.data[cur_p.selected].id;
+                }
+            }
+            llama_sampler_accept(smpl.get(), id);
+            if (gs) {
+                try { llama_sampler_accept(gs, id); }
+                catch (...) { grammar_alive = false; }
+            }
+            if (llama_vocab_is_eog(g.vocab, id)) break;
+            if (llama_vocab_is_control(g.vocab, id) && !preserved.count(id)) break;
+            const std::string piece = token_to_str(g.vocab, id);
+            generated += piece;
+            out.completion_tokens++;
+            bool hit = false;
+            for (const auto & s : stops) {
+                if (s.empty() || generated.size() < s.size()) continue;
+                if (generated.compare(generated.size() - s.size(), s.size(), s) == 0) {
+                    generated.erase(generated.size() - s.size());
+                    hit = true;
+                    stop_hit = true;
+                    break;
+                }
+            }
+            if (hit) break;
+            apply_diffs(true);
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+            if (llama_decode(g.ctx, batch) != 0) {
+                err = "decode error";
+                return false;
+            }
+        }
+
+        apply_diffs(false);
+        out.msg = common_chat_parse(generated, false, pparams);
+        out.msg.set_tool_call_ids(ids_cache, gen_id);
+
+        if (length_hit) out.finish_reason = "length";
+        else if (stop_hit) out.finish_reason = "stop";
+        else if (!out.msg.tool_calls.empty()) out.finish_reason = "tool_calls";
+        else out.finish_reason = "stop";
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
     }
-    const std::string tail = ub.flush();
-    if (!tail.empty()) {
-        out_text += tail;
-        nlohmann::json j;
-        j["id"] = "chatcmpl-anvil";
-        j["object"] = "chat.completion.chunk";
-        j["created"] = now_unix();
-        j["model"] = "anvil";
-        j["choices"] = nlohmann::json::array();
-        nlohmann::json ch;
-        ch["index"] = 0;
-        ch["delta"] = {{"content", tail}};
-        ch["finish_reason"] = nullptr;
-        j["choices"].push_back(ch);
-        http_reply_sse(c, j.dump());
-    }
-    nlohmann::json fin;
-    fin["id"] = "chatcmpl-anvil";
-    fin["object"] = "chat.completion.chunk";
-    fin["created"] = now_unix();
-    fin["model"] = "anvil";
-    fin["choices"] = nlohmann::json::array();
-    nlohmann::json fc;
-    fc["index"] = 0;
-    fc["delta"] = nlohmann::json::object();
-    fc["finish_reason"] = stats.tokens_generated >= max_tokens && max_tokens > 0 ? "length" : "stop";
-    fin["choices"].push_back(fc);
-    http_reply_sse(c, fin.dump());
-    http_reply_sse(c, "[DONE]");
-    stats.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return true;
 }
 
-static bool complete_json(llama_context * ctx, llama_model * model,
-                          const llama_vocab * vocab, llama_sampler * smpl,
-                          llama_memory_t mem, const std::vector<ChatMessage> & history,
-                          const char * tmpl, bool add_bos, llama_token bos_id,
-                          int max_tokens, std::string & out_text, GenStats & stats,
-                          const volatile sig_atomic_t & stop) {
-    std::vector<llama_chat_message> msgs;
-    msgs.reserve(history.size());
-    for (const auto & m : history) msgs.push_back({m.role.c_str(), m.content.c_str()});
-    int32_t n = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true, nullptr, 0);
-    if (n < 0) return false;
-    std::string formatted(static_cast<size_t>(n) + 1, '\0');
-    const int32_t m = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
-                                                formatted.data(), static_cast<int32_t>(formatted.size()));
-    if (m < 0) return false;
-    formatted.resize(static_cast<size_t>(m));
-    std::vector<llama_token> toks = tokenize_render(vocab, formatted);
-    if (toks.empty()) return false;
-    std::vector<llama_token> full;
-    full.reserve(toks.size() + 1);
-    if (add_bos && (toks.empty() || toks[0] != bos_id)) full.push_back(bos_id);
-    full.insert(full.end(), toks.begin(), toks.end());
-    const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
-    for (size_t i = 0; i < full.size(); i += static_cast<size_t>(chunk)) {
-        const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - i);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + i),
-                                                static_cast<int32_t>(nn));
-        if (llama_decode(ctx, batch) != 0) return false;
+static bool serve_completions(ServeGenCtx & g, const nlohmann::ordered_json & body,
+                              ServeResult & out, std::string & err,
+                              const volatile sig_atomic_t & stop) {
+    try {
+        const std::string prompt = body.value("prompt", std::string());
+        if (prompt.empty()) {
+            err = "prompt is required";
+            return false;
+        }
+        std::vector<llama_token> toks = serve_tokenize(g.vocab, prompt, false);
+        if (toks.empty()) {
+            err = "prompt tokenization failed";
+            return false;
+        }
+        if (!serve_decode_all(g.ctx, toks)) {
+            err = "prompt decode failed";
+            return false;
+        }
+        out.prompt_tokens = static_cast<int>(toks.size());
+
+        AnvilConfig cfg = g.cfg;
+        if (body.contains("temperature") && body["temperature"].is_number()) cfg.temp = body["temperature"].get<float>();
+        if (body.contains("top_p") && body["top_p"].is_number()) cfg.top_p = body["top_p"].get<float>();
+        if (body.contains("seed") && body["seed"].is_number_integer()) cfg.seed = body["seed"].get<int>();
+        LlamaSampler smpl(build_sampler_chain(g.vocab, cfg, false, "", cfg.seed));
+        if (!smpl) {
+            err = "sampler init failed";
+            return false;
+        }
+        llama_sampler_reset(smpl.get());
+
+        std::vector<std::string> stops;
+        if (body.contains("stop")) {
+            const auto & s = body["stop"];
+            if (s.is_string()) stops.push_back(s.get<std::string>());
+            else if (s.is_array()) {
+                for (const auto & x : s) if (x.is_string()) stops.push_back(x.get<std::string>());
+            }
+        }
+        const int max_tokens = body.value("max_tokens", 16);
+        std::string generated;
+        bool length_hit = false;
+        while (true) {
+            if (stop) break;
+            if (out.completion_tokens >= max_tokens) {
+                length_hit = true;
+                break;
+            }
+            const llama_token id = llama_sampler_sample(smpl.get(), g.ctx, -1);
+            if (llama_vocab_is_eog(g.vocab, id)) break;
+            const std::string piece = token_to_str(g.vocab, id);
+            generated += piece;
+            out.completion_tokens++;
+            bool hit = false;
+            for (const auto & s : stops) {
+                if (s.empty() || generated.size() < s.size()) continue;
+                if (generated.compare(generated.size() - s.size(), s.size(), s) == 0) {
+                    generated.erase(generated.size() - s.size());
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) break;
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+            if (llama_decode(g.ctx, batch) != 0) {
+                err = "decode error";
+                return false;
+            }
+        }
+        out.msg.role = "assistant";
+        out.msg.content = generated;
+        out.finish_reason = length_hit ? "length" : "stop";
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
     }
-    llama_sampler_reset(smpl);
-    Utf8Buffer ub;
-    const auto t0 = std::chrono::steady_clock::now();
-    while (true) {
-        if (stop) break;
-        if (max_tokens > 0 && stats.tokens_generated >= max_tokens) break;
-        const llama_token id = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(vocab, id)) break;
-        const std::string piece = token_to_str(vocab, id);
-        const std::string printable = ub.feed(piece);
-        if (!printable.empty()) out_text += printable;
-        stats.tokens_generated++;
-        llama_sampler_accept(smpl, id);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
-        if (llama_decode(ctx, batch) != 0) return false;
-    }
-    out_text += ub.flush();
-    stats.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return true;
 }
 
+static bool serve_embeddings(ServeGenCtx & g, const nlohmann::ordered_json & body,
+                             nlohmann::ordered_json & out, std::string & err,
+                             const volatile sig_atomic_t & stop) {
+    try {
+        std::vector<std::string> inputs;
+        if (body.contains("input")) {
+            const auto & in = body["input"];
+            if (in.is_string()) inputs.push_back(in.get<std::string>());
+            else if (in.is_array()) {
+                for (const auto & x : in) if (x.is_string()) inputs.push_back(x.get<std::string>());
+            }
+        }
+        if (inputs.empty()) {
+            err = "input is required";
+            return false;
+        }
+        const bool is_encoder = llama_model_has_encoder(g.model);
+        const int32_t n_embd = llama_model_n_embd(g.model);
+        nlohmann::ordered_json data = nlohmann::ordered_json::array();
+        int total = 0;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (stop) break;
+            llama_memory_clear(g.mem, true);
+            std::vector<llama_token> toks = serve_tokenize(g.vocab, inputs[i], false);
+            if (toks.empty()) {
+                err = "input tokenization failed";
+                return false;
+            }
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(toks.data()),
+                                                    static_cast<int32_t>(toks.size()));
+            llama_set_embeddings(g.ctx, true);
+            const int rc = is_encoder ? llama_encode(g.ctx, batch) : llama_decode(g.ctx, batch);
+            if (rc != 0) {
+                err = "embedding decode failed";
+                return false;
+            }
+            const float * embd = llama_get_embeddings_seq(g.ctx, 0);
+            if (!embd) embd = llama_get_embeddings(g.ctx);
+            if (!embd) {
+                err = "embeddings unavailable for this model";
+                return false;
+            }
+            nlohmann::ordered_json vec = nlohmann::ordered_json::array();
+            for (int32_t j = 0; j < n_embd; j++) vec.push_back(embd[j]);
+            nlohmann::ordered_json item;
+            item["object"] = "embedding";
+            item["index"] = i;
+            item["embedding"] = std::move(vec);
+            data.push_back(std::move(item));
+            total += static_cast<int>(toks.size());
+        }
+        out["object"] = "list";
+        out["data"] = std::move(data);
+        out["model"] = g.model_id;
+        out["usage"] = {{"prompt_tokens", total}, {"total_tokens", total}};
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+}
 
+static nlohmann::ordered_json anthropic_to_oai(const nlohmann::ordered_json & body) {
+    nlohmann::ordered_json oai;
+    nlohmann::ordered_json messages = nlohmann::ordered_json::array();
+    if (body.contains("system")) {
+        const auto & sys = body["system"];
+        std::string text;
+        if (sys.is_string()) text = sys.get<std::string>();
+        else if (sys.is_array()) {
+            for (const auto & b : sys) {
+                if (b.value("type", std::string()) == "text") text += b.value("text", std::string());
+            }
+        }
+        if (!text.empty()) messages.push_back({{"role", "system"}, {"content", text}});
+    }
+    if (body.contains("messages") && body["messages"].is_array()) {
+        for (const auto & msg : body["messages"]) {
+            const std::string role = msg.value("role", std::string());
+            if (!msg.contains("content")) {
+                if (role == "assistant") continue;
+                messages.push_back(msg);
+                continue;
+            }
+            const auto & content = msg["content"];
+            if (content.is_string() || !content.is_array()) {
+                messages.push_back(msg);
+                continue;
+            }
+            nlohmann::ordered_json tool_calls = nlohmann::ordered_json::array();
+            nlohmann::ordered_json converted = nlohmann::ordered_json::array();
+            nlohmann::ordered_json tool_results = nlohmann::ordered_json::array();
+            std::string reasoning;
+            bool has_tool_calls = false;
+            for (const auto & block : content) {
+                const std::string type = block.value("type", std::string());
+                if (type == "text") {
+                    converted.push_back(block);
+                } else if (type == "thinking") {
+                    reasoning += block.value("thinking", std::string());
+                } else if (type == "image") {
+                    const auto source = block.value("source", nlohmann::ordered_json::object());
+                    const std::string stype = source.value("type", std::string());
+                    if (stype == "base64") {
+                        const std::string media = source.value("media_type", std::string("image/jpeg"));
+                        converted.push_back({{"type", "image_url"},
+                                             {"image_url", {{"url", "data:" + media + ";base64," + source.value("data", std::string())}}}});
+                    } else if (stype == "url") {
+                        converted.push_back({{"type", "image_url"},
+                                             {"image_url", {{"url", source.value("url", std::string())}}}});
+                    }
+                } else if (type == "tool_use") {
+                    tool_calls.push_back({{"id", block.value("id", std::string())},
+                                          {"type", "function"},
+                                          {"function", {{"name", block.value("name", std::string())},
+                                                        {"arguments", block.value("input", nlohmann::ordered_json::object()).dump()}}}});
+                    has_tool_calls = true;
+                } else if (type == "tool_result") {
+                    const auto rc = block.value("content", nlohmann::ordered_json());
+                    std::string text;
+                    if (rc.is_string()) text = rc.get<std::string>();
+                    else if (rc.is_array()) {
+                        for (const auto & c : rc) {
+                            if (c.value("type", std::string()) == "text") text += c.value("text", std::string());
+                        }
+                    }
+                    tool_results.push_back({{"role", "tool"},
+                                            {"tool_call_id", block.value("tool_use_id", std::string())},
+                                            {"content", text}});
+                }
+            }
+            if (!converted.empty() || has_tool_calls || !reasoning.empty()) {
+                nlohmann::ordered_json nm = {{"role", role}};
+                if (!converted.empty()) nm["content"] = converted;
+                else nm["content"] = "";
+                if (!tool_calls.empty()) nm["tool_calls"] = tool_calls;
+                if (!reasoning.empty()) nm["reasoning_content"] = reasoning;
+                messages.push_back(std::move(nm));
+            }
+            for (const auto & tr : tool_results) messages.push_back(tr);
+        }
+    }
+    oai["messages"] = std::move(messages);
+    if (body.contains("tools") && body["tools"].is_array()) {
+        nlohmann::ordered_json tools = nlohmann::ordered_json::array();
+        for (const auto & tool : body["tools"]) {
+            tools.push_back({{"type", "function"},
+                             {"function", {{"name", tool.value("name", std::string())},
+                                           {"description", tool.value("description", std::string())},
+                                           {"parameters", tool.contains("input_schema") ? tool["input_schema"] : nlohmann::ordered_json::object()}}}});
+        }
+        oai["tools"] = std::move(tools);
+    }
+    if (body.contains("tool_choice") && body["tool_choice"].is_object()) {
+        const std::string type = body["tool_choice"].value("type", std::string());
+        if (type == "any" || type == "tool") oai["tool_choice"] = "required";
+        else oai["tool_choice"] = type;
+    }
+    if (body.contains("stop_sequences")) oai["stop"] = body["stop_sequences"];
+    oai["max_tokens"] = body.value("max_tokens", 4096);
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream"}) {
+        if (body.contains(key)) oai[key] = body[key];
+    }
+    if (body.contains("thinking") && body["thinking"].is_object()) {
+        if (body["thinking"].value("type", std::string()) == "enabled") {
+            oai["thinking_budget_tokens"] = body["thinking"].value("budget_tokens", 10000);
+        }
+    }
+    return oai;
+}
+
+static nlohmann::ordered_json openai_usage(const ServeResult & r) {
+    return {{"prompt_tokens", r.prompt_tokens},
+            {"completion_tokens", r.completion_tokens},
+            {"total_tokens", r.prompt_tokens + r.completion_tokens}};
+}
+
+static nlohmann::ordered_json openai_message(const common_chat_msg & msg) {
+    nlohmann::ordered_json m;
+    m["role"] = "assistant";
+    if (!msg.reasoning_content.empty()) m["reasoning_content"] = msg.reasoning_content;
+    if (!msg.content.empty()) m["content"] = msg.content;
+    else m["content"] = "";
+    if (!msg.tool_calls.empty()) {
+        nlohmann::ordered_json tcs = nlohmann::ordered_json::array();
+        for (const auto & tc : msg.tool_calls) {
+            tcs.push_back({{"id", tc.id}, {"type", "function"},
+                           {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}});
+        }
+        m["tool_calls"] = std::move(tcs);
+    }
+    return m;
+}
+
+static nlohmann::ordered_json openai_chunk_delta(const common_chat_msg_diff & d, bool & first_role) {
+    nlohmann::ordered_json delta = nlohmann::ordered_json::object();
+    if (first_role) {
+        delta["role"] = "assistant";
+        first_role = false;
+    }
+    if (!d.reasoning_content_delta.empty()) delta["reasoning_content"] = d.reasoning_content_delta;
+    if (!d.content_delta.empty()) delta["content"] = d.content_delta;
+    if (d.tool_call_index != std::string::npos) {
+        nlohmann::ordered_json tc;
+        tc["index"] = d.tool_call_index;
+        if (!d.tool_call_delta.id.empty()) {
+            tc["id"] = d.tool_call_delta.id;
+            tc["type"] = "function";
+        }
+        if (!d.tool_call_delta.name.empty() || !d.tool_call_delta.arguments.empty()) {
+            nlohmann::ordered_json fn = nlohmann::ordered_json::object();
+            if (!d.tool_call_delta.name.empty()) fn["name"] = d.tool_call_delta.name;
+            if (!d.tool_call_delta.arguments.empty()) fn["arguments"] = d.tool_call_delta.arguments;
+            tc["function"] = fn;
+        }
+        delta["tool_calls"] = nlohmann::ordered_json::array({tc});
+    }
+    return delta;
+}
+
+static std::string openai_stream_chunk(const std::string & id, const std::string & model,
+                                       const nlohmann::ordered_json & delta, const char * finish) {
+    nlohmann::ordered_json chunk;
+    chunk["id"] = id;
+    chunk["object"] = "chat.completion.chunk";
+    chunk["created"] = now_unix();
+    chunk["model"] = model;
+    nlohmann::ordered_json ch;
+    ch["index"] = 0;
+    ch["delta"] = delta;
+    ch["finish_reason"] = finish ? nlohmann::ordered_json(finish) : nlohmann::ordered_json(nullptr);
+    chunk["choices"] = nlohmann::ordered_json::array({ch});
+    return "data: " + chunk.dump() + "\n\n";
+}
+
+static std::string anthropic_event(const char * ev, const nlohmann::ordered_json & data) {
+    return std::string("event: ") + ev + "\ndata: " + data.dump() + "\n\n";
+}
+
+static std::string anthropic_stop_reason(const std::string & oai_reason) {
+    if (oai_reason == "tool_calls") return "tool_use";
+    if (oai_reason == "length") return "max_tokens";
+    if (oai_reason == "stop") return "end_turn";
+    return "end_turn";
+}
+
+static nlohmann::ordered_json anthropic_message(const ServeResult & r, const std::string & id, const std::string & model) {
+    nlohmann::ordered_json msg;
+    msg["id"] = id;
+    msg["type"] = "message";
+    msg["role"] = "assistant";
+    nlohmann::ordered_json content = nlohmann::ordered_json::array();
+    if (!r.msg.reasoning_content.empty()) {
+        content.push_back({{"type", "thinking"}, {"thinking", r.msg.reasoning_content}});
+    }
+    if (!r.msg.content.empty()) {
+        content.push_back({{"type", "text"}, {"text", r.msg.content}});
+    }
+    for (const auto & tc : r.msg.tool_calls) {
+        nlohmann::ordered_json input;
+        try {
+            input = nlohmann::ordered_json::parse(tc.arguments);
+        } catch (...) {
+            input = tc.arguments;
+        }
+        content.push_back({{"type", "tool_use"}, {"id", tc.id}, {"name", tc.name}, {"input", input}});
+    }
+    msg["content"] = std::move(content);
+    msg["model"] = model;
+    msg["stop_reason"] = anthropic_stop_reason(r.finish_reason);
+    msg["stop_sequence"] = nullptr;
+    msg["usage"] = {{"input_tokens", r.prompt_tokens}, {"output_tokens", r.completion_tokens}};
+    return msg;
+}
 static int cmd_bench(CliArgs & cli) {
     for (size_t i = 0; i < cli.sub_args.size(); i++) {
         const std::string & a = cli.sub_args[i];
@@ -3350,7 +3734,6 @@ static int cmd_bench(CliArgs & cli) {
         while (gen < n_tokens) {
             const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
             if (llama_vocab_is_eog(vocab, id)) break;
-            llama_sampler_accept(smpl.get(), id);
             llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
             if (llama_decode(ctx, batch) != 0) break;
             gen++;
@@ -3762,29 +4145,6 @@ static bool maybe_auto_pull(std::string & model, std::string & path, std::string
     }
     return false;
 }
-static bool parse_messages_json(const nlohmann::json & j, std::vector<ChatMessage> & out) {
-    if (!j.contains("messages") || !j["messages"].is_array()) return false;
-    for (const auto & m : j["messages"]) {
-        if (!m.is_object() || !m.contains("role") || !m.contains("content")) continue;
-        ChatMessage cm;
-        cm.role = m["role"].get<std::string>();
-        if (m["content"].is_string()) {
-            cm.content = m["content"].get<std::string>();
-        } else if (m["content"].is_array()) {
-            for (const auto & part : m["content"]) {
-                if (part.is_object() && part.contains("type") &&
-                    part["type"].get<std::string>() == "text" && part.contains("text")) {
-                    cm.content += part["text"].get<std::string>();
-                }
-            }
-        }
-        if (cm.role == "system" || cm.role == "user" || cm.role == "assistant") {
-            out.push_back(std::move(cm));
-        }
-    }
-    return !out.empty();
-}
-
 static int cmd_serve(CliArgs & cli) {
     for (size_t i = 0; i < cli.sub_args.size(); i++) {
         const std::string & a = cli.sub_args[i];
@@ -3814,6 +4174,8 @@ static int cmd_serve(CliArgs & cli) {
             cli.flash_attn = false; cli.no_flash_attn = true;
         } else if (a == "--threads") {
             if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.n_threads); }
+        } else if (a == "--api-key") {
+            if (i + 1 < cli.sub_args.size()) cli.api_key = cli.sub_args[++i];
         } else if (!a.empty() && a[0] != '-' && cli.model.empty()) {
             cli.model = a;
         } else {
@@ -3871,9 +4233,6 @@ static int cmd_serve(CliArgs & cli) {
         return 1;
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    const char * tmpl = llama_model_chat_template(model, nullptr);
-    const bool add_bos = llama_vocab_get_add_bos(vocab);
-    const llama_token bos_id = llama_vocab_bos(vocab);
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = static_cast<uint32_t>(cfg.n_ctx > 0 ? cfg.n_ctx : 4096);
@@ -3882,142 +4241,362 @@ static int cmd_serve(CliArgs & cli) {
     cparams.flash_attn_type = cfg.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k = cfg.type_k;
     cparams.type_v = cfg.type_v;
+    cparams.embeddings = true;
     LlamaContext ctx(llama_init_from_model(model, cparams));
     if (!ctx) {
         fprintf(stderr, "\033[31merror: failed to create context\033[0m\n");
         return 1;
     }
     llama_memory_t mem = llama_get_memory(ctx);
-    LlamaSampler smpl(build_sampler_chain(vocab, cfg, false, ""));
-    if (!smpl) {
-        fprintf(stderr, "\033[31merror: failed to initialize sampler\033[0m\n");
+    llama_set_embeddings(ctx, true);
+
+    common_chat_templates_ptr tmpls = common_chat_templates_init(model.get(), "", "", "");
+    if (!tmpls) {
+        fprintf(stderr, "\033[31merror: model has no usable chat template\033[0m\n");
         return 1;
     }
 
-    if (!sock_init()) {
-        fprintf(stderr, "\033[31merror: socket init failed\033[0m\n");
-        return 1;
+    ServeGenCtx g;
+    g.ctx = ctx.get();
+    g.model = model.get();
+    g.vocab = vocab;
+    g.mem = mem;
+    g.tmpls = tmpls.get();
+    g.cfg = cfg;
+    g.model_id = friendly;
+
+    std::string api_key = cli.api_key;
+    if (api_key.empty()) {
+        const char * env = std::getenv("ANVIL_API_KEY");
+        if (env && env[0]) api_key = env;
     }
-    anvil_sock_t ls = sock_listen(cli.host, cli.port);
-    if (ls == ANVIL_SOCK_INVALID) {
-        fprintf(stderr, "\033[31merror: could not listen on %s:%d\033[0m\n",
-                cli.host.c_str(), cli.port);
-        sock_shutdown();
-        return 1;
-    }
-    fprintf(stderr, "\033[1;32manvil serve\033[0m  model=%s  %s:%d\n",
-            cli.friendly.c_str(), cli.host.c_str(), cli.port);
+    g_serve_api_key = api_key;
+
+    httplib::Server svr;
+    svr.set_write_timeout(0);
+    svr.set_read_timeout(0);
+    svr.set_payload_max_length(64 * 1024 * 1024);
+
+    auto cors = [](httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version");
+    };
+    auto auth_ok = [&](const httplib::Request & req) -> bool {
+        if (g_serve_api_key.empty()) return true;
+        const std::string & h = req.get_header_value("Authorization");
+        if (h.rfind("Bearer ", 0) == 0 && h.substr(7) == g_serve_api_key) return true;
+        if (req.get_header_value("x-api-key") == g_serve_api_key) return true;
+        return false;
+    };
+
+    svr.set_pre_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
+        if (req.method == "OPTIONS") {
+            res.status = 204;
+            cors(res);
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (req.path == "/healthz") return httplib::Server::HandlerResponse::Unhandled;
+        if (!auth_ok(req)) {
+            cors(res);
+            res.status = 401;
+            res.set_content(R"({"error":{"message":"invalid api key","type":"authentication_error"}})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.Get("/healthz", [](const httplib::Request &, httplib::Response & res) {
+        res.set_content(R"({"status":"ok"})", "application/json");
+    });
+    svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+        nlohmann::ordered_json j;
+        j["object"] = "list";
+        j["data"] = nlohmann::ordered_json::array();
+        nlohmann::ordered_json m;
+        m["id"] = g.model_id;
+        m["object"] = "model";
+        m["created"] = 0;
+        m["owned_by"] = "anvil";
+        j["data"].push_back(m);
+        for (const auto & e : load_models()) {
+            nlohmann::ordered_json em;
+            em["id"] = e.name;
+            em["object"] = "model";
+            em["created"] = 0;
+            em["owned_by"] = e.source.empty() ? "anvil" : e.source;
+            j["data"].push_back(em);
+        }
+        res.set_content(j.dump(), "application/json");
+    });
+
+    auto handle_chat = [&](const httplib::Request & req, httplib::Response & res, bool anthropic) {
+        cors(res);
+        nlohmann::ordered_json body;
+        try {
+            body = nlohmann::ordered_json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid json","type":"invalid_request_error"}})", "application/json");
+            return;
+        }
+        nlohmann::ordered_json oai = anthropic ? anthropic_to_oai(body) : body;
+        const bool stream = oai.value("stream", false);
+        const std::string id = serve_id(anthropic ? "msg_" : "chatcmpl-");
+        ServeResult out;
+        std::string err;
+
+        if (!stream) {
+            std::lock_guard<std::mutex> lock(g_serve_infer_lock);
+            if (!serve_chat(g, oai, nullptr, out, err, g_serve_stop)) {
+                res.status = 500;
+                nlohmann::ordered_json e;
+                e["error"] = {{"message", err}, {"type", "server_error"}};
+                res.set_content(e.dump(), "application/json");
+                return;
+            }
+            if (anthropic) {
+                res.set_content(anthropic_message(out, id, g.model_id).dump(), "application/json");
+            } else {
+                nlohmann::ordered_json resp;
+                resp["id"] = id;
+                resp["object"] = "chat.completion";
+                resp["created"] = now_unix();
+                resp["model"] = g.model_id;
+                nlohmann::ordered_json ch;
+                ch["index"] = 0;
+                ch["message"] = openai_message(out.msg);
+                ch["finish_reason"] = out.finish_reason;
+                resp["choices"] = nlohmann::ordered_json::array({ch});
+                resp["usage"] = openai_usage(out);
+                res.set_content(resp.dump(), "application/json");
+            }
+            return;
+        }
+
+        const bool include_usage = oai.value("stream_options", nlohmann::ordered_json::object()).value("include_usage", false);
+        res.set_chunked_content_provider("text/event-stream", [&, oai, id, include_usage, out, err](size_t, httplib::DataSink & sink) mutable {
+            std::lock_guard<std::mutex> lock(g_serve_infer_lock);
+            auto sse = [&](const std::string & s) -> bool {
+                return sink.write(s.data(), s.size());
+            };
+            if (anthropic) {
+                std::string block_type;
+                int block_idx = -1;
+                int sent_tool_idx = -1;
+                std::string sent_tool_id;
+                std::string sent_tool_name;
+                int prompt_tokens = 0;
+                auto close_block = [&]() {
+                    if (block_idx < 0) return;
+                    nlohmann::ordered_json stop;
+                    stop["type"] = "content_block_stop";
+                    stop["index"] = block_idx;
+                    sse(anthropic_event("content_block_stop", stop));
+                    block_idx = -1;
+                    block_type.clear();
+                };
+                auto open_block = [&](const nlohmann::ordered_json & block) {
+                    block_idx++;
+                    nlohmann::ordered_json start;
+                    start["type"] = "content_block_start";
+                    start["index"] = block_idx;
+                    start["content_block"] = block;
+                    sse(anthropic_event("content_block_start", start));
+                };
+                auto emit = [&](const common_chat_msg_diff & d) -> bool {
+                    if (!d.reasoning_content_delta.empty()) {
+                        if (block_type != "thinking") {
+                            close_block();
+                            open_block({{"type", "thinking"}, {"thinking", ""}, {"signature", ""}});
+                            block_type = "thinking";
+                        }
+                        nlohmann::ordered_json ev;
+                        ev["type"] = "content_block_delta";
+                        ev["index"] = block_idx;
+                        ev["delta"] = {{"type", "thinking_delta"}, {"thinking", d.reasoning_content_delta}};
+                        return sse(anthropic_event("content_block_delta", ev));
+                    }
+                    if (!d.content_delta.empty()) {
+                        if (block_type != "text") {
+                            close_block();
+                            open_block({{"type", "text"}, {"text", ""}});
+                            block_type = "text";
+                        }
+                        nlohmann::ordered_json ev;
+                        ev["type"] = "content_block_delta";
+                        ev["index"] = block_idx;
+                        ev["delta"] = {{"type", "text_delta"}, {"text", d.content_delta}};
+                        return sse(anthropic_event("content_block_delta", ev));
+                    }
+                    if (d.tool_call_index != std::string::npos) {
+                        const size_t i = d.tool_call_index;
+                        if (sent_tool_idx != static_cast<int>(i)) {
+                            close_block();
+                            sent_tool_idx = static_cast<int>(i);
+                            if (!d.tool_call_delta.id.empty()) sent_tool_id = d.tool_call_delta.id;
+                            if (!d.tool_call_delta.name.empty()) sent_tool_name = d.tool_call_delta.name;
+                            open_block({{"type", "tool_use"},
+                                        {"id", sent_tool_id},
+                                        {"name", sent_tool_name},
+                                        {"input", nlohmann::ordered_json::object()}});
+                            block_type = "tool_use";
+                        }
+                        if (!d.tool_call_delta.arguments.empty()) {
+                            nlohmann::ordered_json ev;
+                            ev["type"] = "content_block_delta";
+                            ev["index"] = block_idx;
+                            ev["delta"] = {{"type", "input_json_delta"}, {"partial_json", d.tool_call_delta.arguments}};
+                            return sse(anthropic_event("content_block_delta", ev));
+                        }
+                    }
+                    return true;
+                };
+                nlohmann::ordered_json start_msg;
+                start_msg["type"] = "message_start";
+                start_msg["message"] = {{"id", id}, {"type", "message"}, {"role", "assistant"},
+                                        {"content", nlohmann::ordered_json::array()}, {"model", g.model_id},
+                                        {"stop_reason", nullptr}, {"stop_sequence", nullptr},
+                                        {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}};
+                sse(anthropic_event("message_start", start_msg));
+                const bool ok = serve_chat(g, oai, emit, out, err, g_serve_stop, [&](int n) { prompt_tokens = n; });
+                close_block();
+                if (!ok) {
+                    nlohmann::ordered_json ev;
+                    ev["type"] = "error";
+                    ev["error"] = {{"type", "server_error"}, {"message", err}};
+                    sse(anthropic_event("error", ev));
+                } else {
+                    nlohmann::ordered_json delta_ev;
+                    delta_ev["type"] = "message_delta";
+                    delta_ev["delta"] = {{"stop_reason", anthropic_stop_reason(out.finish_reason)}, {"stop_sequence", nullptr}};
+                    delta_ev["usage"] = {{"output_tokens", out.completion_tokens}};
+                    sse(anthropic_event("message_delta", delta_ev));
+                    sse(anthropic_event("message_stop", {{"type", "message_stop"}}));
+                }
+                sink.done();
+                return true;
+            }
+            nlohmann::ordered_json start;
+            start["id"] = id;
+            start["object"] = "chat.completion.chunk";
+            start["created"] = now_unix();
+            start["model"] = g.model_id;
+            nlohmann::ordered_json sch;
+            sch["index"] = 0;
+            sch["delta"] = {{"role", "assistant"}};
+            sch["finish_reason"] = nullptr;
+            start["choices"] = nlohmann::ordered_json::array({sch});
+            sse("data: " + start.dump() + "\n\n");
+            bool first_role = false;
+            auto emit = [&](const common_chat_msg_diff & d) -> bool {
+                const std::string chunk = openai_stream_chunk(id, g.model_id, openai_chunk_delta(d, first_role), nullptr);
+                return sse(chunk);
+            };
+            const bool ok = serve_chat(g, oai, emit, out, err, g_serve_stop);
+            if (!ok) {
+                nlohmann::ordered_json e;
+                e["error"] = {{"message", err}, {"type", "server_error"}};
+                sse("data: " + e.dump() + "\n\n");
+            } else {
+                sse(openai_stream_chunk(id, g.model_id, nlohmann::ordered_json::object(), out.finish_reason.c_str()));
+                if (include_usage) {
+                    nlohmann::ordered_json uc;
+                    uc["id"] = id;
+                    uc["object"] = "chat.completion.chunk";
+                    uc["created"] = now_unix();
+                    uc["model"] = g.model_id;
+                    uc["choices"] = nlohmann::ordered_json::array();
+                    uc["usage"] = openai_usage(out);
+                    sse("data: " + uc.dump() + "\n\n");
+                }
+                sse("data: [DONE]\n\n");
+            }
+            sink.done();
+            return true;
+        });
+    };
+
+    svr.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
+        handle_chat(req, res, false);
+    });
+    svr.Post("/v1/messages", [&](const httplib::Request & req, httplib::Response & res) {
+        handle_chat(req, res, true);
+    });
+    svr.Post("/v1/completions", [&](const httplib::Request & req, httplib::Response & res) {
+        cors(res);
+        std::lock_guard<std::mutex> lock(g_serve_infer_lock);
+        nlohmann::ordered_json body;
+        try {
+            body = nlohmann::ordered_json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid json","type":"invalid_request_error"}})", "application/json");
+            return;
+        }
+        const std::string id = serve_id("cmpl-");
+        ServeResult out;
+        std::string err;
+        if (!serve_completions(g, body, out, err, g_serve_stop)) {
+            res.status = 500;
+            nlohmann::ordered_json e;
+            e["error"] = {{"message", err}, {"type", "server_error"}};
+            res.set_content(e.dump(), "application/json");
+            return;
+        }
+        nlohmann::ordered_json resp;
+        resp["id"] = id;
+        resp["object"] = "text_completion";
+        resp["created"] = now_unix();
+        resp["model"] = g.model_id;
+        nlohmann::ordered_json ch;
+        ch["index"] = 0;
+        ch["text"] = out.msg.content;
+        ch["finish_reason"] = out.finish_reason;
+        resp["choices"] = nlohmann::ordered_json::array({ch});
+        resp["usage"] = openai_usage(out);
+        res.set_content(resp.dump(), "application/json");
+    });
+    svr.Post("/v1/embeddings", [&](const httplib::Request & req, httplib::Response & res) {
+        cors(res);
+        std::lock_guard<std::mutex> lock(g_serve_infer_lock);
+        nlohmann::ordered_json body;
+        try {
+            body = nlohmann::ordered_json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid json","type":"invalid_request_error"}})", "application/json");
+            return;
+        }
+        nlohmann::ordered_json out;
+        std::string err;
+        if (!serve_embeddings(g, body, out, err, g_serve_stop)) {
+            res.status = 500;
+            nlohmann::ordered_json e;
+            e["error"] = {{"message", err}, {"type", "server_error"}};
+            res.set_content(e.dump(), "application/json");
+            return;
+        }
+        res.set_content(out.dump(), "application/json");
+    });
+
+    fprintf(stderr, "\033[1;32manvil serve\033[0m  model=%s  %s:%d\n", g.model_id.c_str(), cli.host.c_str(), cli.port);
     fprintf(stderr, "  GET  /v1/models\n");
-    fprintf(stderr, "  POST /v1/chat/completions  (stream + non-stream)\n");
+    fprintf(stderr, "  POST /v1/chat/completions  (OpenAI, stream + non-stream, tools)\n");
+    fprintf(stderr, "  POST /v1/messages          (Anthropic, stream + non-stream, tools)\n");
+    fprintf(stderr, "  POST /v1/completions\n");
+    fprintf(stderr, "  POST /v1/embeddings\n");
     fprintf(stderr, "  Ctrl+C to stop\n\n");
 
     g_serve_stop = 0;
     install_sigint([](int) { g_serve_stop = 1; }, false);
-
-    while (!g_serve_stop) {
-        anvil_sock_t c = accept(ls, nullptr, nullptr);
-        if (c == ANVIL_SOCK_INVALID) {
-            if (g_serve_stop) break;
-            continue;
-        }
-        HttpRequest req;
-        if (!parse_http_request(c, req)) {
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        if (req.method == "OPTIONS") {
-            http_reply(c, 200, "text/plain", "", true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        if (req.path == "/v1/models" && req.method == "GET") {
-            std::vector<ModelEntry> models = load_models();
-            nlohmann::json j;
-            j["object"] = "list";
-            j["data"] = nlohmann::json::array();
-            for (const auto & e : models) {
-                nlohmann::json m;
-                m["id"] = e.name;
-                m["object"] = "model";
-                m["created"] = 0;
-                m["owned_by"] = e.source.empty() ? "anvil" : e.source;
-                j["data"].push_back(m);
-            }
-            http_reply(c, 200, "application/json", j.dump(), true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        if (req.path != "/v1/chat/completions" || req.method != "POST") {
-            http_reply(c, 404, "application/json", "{\"error\":\"not found\"}", true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        nlohmann::json jbody;
-        try {
-            jbody = nlohmann::json::parse(req.body);
-        } catch (const nlohmann::json::exception &) {
-            http_reply(c, 400, "application/json", "{\"error\":\"invalid json\"}", true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        std::vector<ChatMessage> history;
-        if (!parse_messages_json(jbody, history) || history.empty()) {
-            http_reply(c, 400, "application/json", "{\"error\":\"messages required\"}", true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        bool stream = jbody.contains("stream") && jbody["stream"].is_boolean() && jbody["stream"].get<bool>();
-        int max_tokens = cli.max_tokens;
-        if (jbody.contains("max_tokens") && jbody["max_tokens"].is_number_integer()) {
-            max_tokens = jbody["max_tokens"].get<int>();
-        }
-        std::string out_text;
-        GenStats stats;
-        if (stream) {
-            std::string hdr = "HTTP/1.1 200 OK\r\n";
-            hdr += "Content-Type: text/event-stream\r\n";
-            hdr += "Cache-Control: no-store\r\n";
-            hdr += "Access-Control-Allow-Origin: *\r\n";
-            hdr += "Connection: close\r\n\r\n";
-            sock_send(c, hdr);
-        }
-        const bool ok = stream
-            ? complete_stream(c, ctx.get(), model.get(), vocab, smpl.get(), mem, history,
-                              tmpl, add_bos, bos_id, max_tokens, out_text, stats, g_serve_stop)
-            : complete_json(ctx.get(), model.get(), vocab, smpl.get(), mem, history,
-                            tmpl, add_bos, bos_id, max_tokens, out_text, stats, g_serve_stop);
-        if (!ok && !stream) {
-            http_reply(c, 500, "application/json", "{\"error\":\"generation failed\"}", true);
-            ANVIL_SOCK_CLOSE(c);
-            continue;
-        }
-        if (!stream) {
-            nlohmann::json resp;
-            resp["id"] = "chatcmpl-anvil";
-            resp["object"] = "chat.completion";
-            resp["created"] = now_unix();
-            resp["model"] = "anvil";
-            resp["choices"] = nlohmann::json::array();
-            nlohmann::json ch;
-            ch["index"] = 0;
-            ch["message"] = {{"role", "assistant"}, {"content", out_text}};
-            ch["finish_reason"] = stats.tokens_generated >= max_tokens && max_tokens > 0 ? "length" : "stop";
-            resp["choices"].push_back(ch);
-            resp["usage"] = {
-                {"prompt_tokens", 0},
-                {"completion_tokens", stats.tokens_generated},
-                {"total_tokens", stats.tokens_generated},
-            };
-            http_reply(c, 200, "application/json", resp.dump(), true);
-        }
-        ANVIL_SOCK_CLOSE(c);
-    }
-    ANVIL_SOCK_CLOSE(ls);
-    sock_shutdown();
+    std::thread t([&]() { svr.listen(cli.host, cli.port); });
+    while (!g_serve_stop) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    svr.stop();
+    t.join();
     printf("\nserver stopped\n");
     return 0;
 }
-
 static std::string session_path() {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -4085,7 +4664,7 @@ static void print_ctx_bar(int used, int total) {
 
 static llama_sampler * build_sampler_chain(
         const llama_vocab * vocab, const AnvilConfig & cfg,
-        bool grammar_active, const std::string & grammar_src) {
+        bool grammar_active, const std::string & grammar_src, int seed) {
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
 
     if (cfg.top_k > 0) llama_sampler_chain_add(smpl, llama_sampler_init_top_k(cfg.top_k));
@@ -4093,7 +4672,7 @@ static llama_sampler * build_sampler_chain(
     llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
     if (cfg.temp > 0.0f) llama_sampler_chain_add(smpl, llama_sampler_init_temp(cfg.temp));
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, cfg.repeat_penalty, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed >= 0 ? static_cast<uint32_t>(seed) : LLAMA_DEFAULT_SEED));
     if (grammar_active) {
         llama_sampler * g = llama_sampler_init_grammar(vocab, grammar_src.c_str(), "root");
         if (g) llama_sampler_chain_add(smpl, g);
@@ -4346,7 +4925,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             response += piece;
             stats.tokens_generated++;
             prev_tokens.push_back(id);
-            llama_sampler_accept(smpl.get(), id);
 
             llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
             if (llama_decode(ctx, batch) != 0) {
