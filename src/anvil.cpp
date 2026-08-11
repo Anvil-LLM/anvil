@@ -645,6 +645,7 @@ struct CliArgs {
     std::string host        = "127.0.0.1";
     int         bench_tokens = 32;
     int         bench_ctx   = 0;
+    int         slots       = 1;
 };
 
 inline constexpr int   MAX_CTX      = INT32_MAX;
@@ -669,6 +670,7 @@ void print_usage() {
     printf("  anvil pull ollama:<name>[:tag]  Pull from the Ollama registry\n");
     printf("  anvil pull hf:<repo>[:file]     Pull from HuggingFace\n");
     printf("  anvil serve [--port <n>]        OpenAI-compatible API server\n");
+    printf("                         [--slots <n>]  KV slots with cross-request prefix caching\n");
     printf("  anvil bench <model> [options]   TurboQuant KV benchmark\n");
     printf("  anvil doctor                    System diagnostics\n");
     printf("  anvil self-update               Update to the latest release\n");
@@ -2960,16 +2962,179 @@ static std::vector<llama_token> serve_tokenize(const llama_vocab * vocab, const 
     return toks;
 }
 
-static bool serve_decode_all(llama_context * ctx, const std::vector<llama_token> & toks) {
+static bool serve_decode_slot(llama_context * ctx, llama_seq_id seq, llama_pos start_pos,
+                              const std::vector<llama_token> & toks) {
     const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
     for (size_t i = 0; i < toks.size(); i += static_cast<size_t>(chunk)) {
         const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), toks.size() - i);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(toks.data() + i),
-                                                static_cast<int32_t>(nn));
-        if (llama_decode(ctx, batch) != 0) return false;
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(nn), 0, 1);
+        batch.n_tokens = static_cast<int32_t>(nn);
+        for (size_t j = 0; j < nn; j++) {
+            batch.token[j] = toks[i + j];
+            batch.pos[j] = start_pos + static_cast<llama_pos>(i + j);
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = seq;
+            batch.logits[j] = 1;
+        }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) return false;
     }
     return true;
 }
+
+static bool serve_decode_one(llama_context * ctx, llama_seq_id seq, llama_pos pos, llama_token id) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens = 1;
+    batch.token[0] = id;
+    batch.pos[0] = pos;
+    batch.n_seq_id[0] = 1;
+    batch.seq_id[0][0] = seq;
+    batch.logits[0] = 1;
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return rc == 0;
+}
+
+struct ServeSlot {
+    llama_seq_id id = 0;
+    std::vector<llama_token> prompt_tokens;
+    llama_pos n_past = 0;
+    bool busy = false;
+    int64_t t_last_used = 0;
+};
+
+struct ServeSlots {
+    llama_context * ctx = nullptr;
+    llama_memory_t mem = nullptr;
+    common_context_seq_rm_type rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    std::vector<ServeSlot> slots;
+    size_t min_prefix = 8;
+
+    llama_seq_id emb_seq() const { return static_cast<llama_seq_id>(slots.size()); }
+
+    void init(llama_context * c, llama_memory_t m, int n) {
+        ctx = c;
+        mem = m;
+        rm_type = common_context_can_seq_rm(ctx);
+        slots.clear();
+        for (int i = 0; i < n; i++) {
+            ServeSlot s;
+            s.id = static_cast<llama_seq_id>(i);
+            s.t_last_used = now_unix();
+            slots.push_back(s);
+        }
+    }
+
+    void reset_all() {
+        for (auto & s : slots) {
+            llama_memory_seq_rm(mem, s.id, -1, -1);
+            s.prompt_tokens.clear();
+            s.n_past = 0;
+            s.busy = false;
+            s.t_last_used = now_unix();
+        }
+        if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            llama_memory_clear(mem, true);
+        }
+    }
+
+    static size_t common_prefix(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+        return n;
+    }
+
+    ServeSlot * acquire(const std::vector<llama_token> & toks) {
+        ServeSlot * best = nullptr;
+        size_t best_lcp = 0;
+        for (auto & s : slots) {
+            if (s.busy || s.prompt_tokens.empty()) continue;
+            const size_t lcp = common_prefix(s.prompt_tokens, toks);
+            if (lcp >= min_prefix && lcp > best_lcp) {
+                best_lcp = lcp;
+                best = &s;
+            }
+        }
+        if (best) {
+            best->busy = true;
+            return best;
+        }
+        ServeSlot * lru = nullptr;
+        for (auto & s : slots) {
+            if (s.busy) continue;
+            if (!lru || s.t_last_used < lru->t_last_used) lru = &s;
+        }
+        if (lru) lru->busy = true;
+        return lru;
+    }
+
+    void release(ServeSlot & s) {
+        s.busy = false;
+        s.t_last_used = now_unix();
+    }
+
+    bool prepare(ServeSlot & s, const std::vector<llama_token> & toks) {
+        size_t n_common = common_prefix(s.prompt_tokens, toks);
+        if (rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            for (const auto & o : slots) {
+                if (o.id == s.id || o.prompt_tokens.empty()) continue;
+                const size_t lcp = common_prefix(o.prompt_tokens, toks);
+                if (lcp > n_common && lcp >= min_prefix) {
+                    llama_memory_seq_cp(mem, o.id, s.id, 0, static_cast<llama_pos>(lcp));
+                    n_common = lcp;
+                }
+            }
+        }
+        if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            llama_memory_clear(mem, true);
+            for (auto & o : slots) {
+                o.prompt_tokens.clear();
+                o.n_past = 0;
+            }
+            n_common = 0;
+        } else if (n_common < static_cast<size_t>(s.n_past)) {
+            const bool can_partial = rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                                     rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+            if (can_partial) {
+                if (!llama_memory_seq_rm(mem, s.id, static_cast<llama_pos>(n_common), -1)) {
+                    llama_memory_seq_rm(mem, s.id, -1, -1);
+                    n_common = 0;
+                }
+            } else {
+                llama_memory_seq_rm(mem, s.id, -1, -1);
+                n_common = 0;
+            }
+        }
+        if (n_common < toks.size()) {
+            const std::vector<llama_token> suffix(toks.begin() + static_cast<long>(n_common), toks.end());
+            if (!serve_decode_slot(ctx, s.id, static_cast<llama_pos>(n_common), suffix)) return false;
+        } else {
+            std::vector<llama_token> last{toks.back()};
+            if (!serve_decode_slot(ctx, s.id, static_cast<llama_pos>(n_common) - 1, last)) return false;
+        }
+        s.prompt_tokens = toks;
+        s.n_past = static_cast<llama_pos>(toks.size());
+        return true;
+    }
+
+    bool decode_token(ServeSlot & s, llama_token id) {
+        if (!serve_decode_one(ctx, s.id, s.n_past, id)) return false;
+        s.n_past++;
+        return true;
+    }
+
+    void extend(ServeSlot & s, const std::vector<llama_token> & gen) {
+        if (gen.empty()) return;
+        s.prompt_tokens.insert(s.prompt_tokens.end(), gen.begin(), gen.end());
+    }
+};
+
+struct SlotHolder {
+    ServeSlots & pool;
+    ServeSlot * slot;
+    ~SlotHolder() { if (slot) pool.release(*slot); }
+};
 
 struct ServeGenCtx {
     llama_context * ctx = nullptr;
@@ -2979,6 +3144,7 @@ struct ServeGenCtx {
     common_chat_templates * tmpls = nullptr;
     AnvilConfig cfg;
     std::string model_id;
+    ServeSlots slots;
 };
 
 struct ServeResult {
@@ -3052,12 +3218,19 @@ static bool serve_chat(ServeGenCtx & g, const nlohmann::ordered_json & body,
             err = "prompt tokenization failed";
             return false;
         }
-        if (!serve_decode_all(g.ctx, toks)) {
+        ServeSlot * slot = g.slots.acquire(toks);
+        if (!slot) {
+            err = "all slots busy";
+            return false;
+        }
+        SlotHolder holder{g.slots, slot};
+        if (!g.slots.prepare(*slot, toks)) {
             err = "prompt decode failed";
             return false;
         }
         out.prompt_tokens = static_cast<int>(toks.size());
         if (on_prompt) on_prompt(out.prompt_tokens);
+        std::vector<llama_token> gen_toks;
 
         AnvilConfig cfg = g.cfg;
         if (body.contains("temperature") && body["temperature"].is_number()) cfg.temp = body["temperature"].get<float>();
@@ -3238,12 +3411,13 @@ static bool serve_chat(ServeGenCtx & g, const nlohmann::ordered_json & body,
             }
             if (hit) break;
             apply_diffs(true);
-            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
-            if (llama_decode(g.ctx, batch) != 0) {
+            gen_toks.push_back(id);
+            if (!g.slots.decode_token(*slot, id)) {
                 err = "decode error";
                 return false;
             }
         }
+        g.slots.extend(*slot, gen_toks);
 
         apply_diffs(false);
         out.msg = common_chat_parse(generated, false, pparams);
@@ -3274,11 +3448,18 @@ static bool serve_completions(ServeGenCtx & g, const nlohmann::ordered_json & bo
             err = "prompt tokenization failed";
             return false;
         }
-        if (!serve_decode_all(g.ctx, toks)) {
+        ServeSlot * slot = g.slots.acquire(toks);
+        if (!slot) {
+            err = "all slots busy";
+            return false;
+        }
+        SlotHolder holder{g.slots, slot};
+        if (!g.slots.prepare(*slot, toks)) {
             err = "prompt decode failed";
             return false;
         }
         out.prompt_tokens = static_cast<int>(toks.size());
+        std::vector<llama_token> gen_toks;
 
         AnvilConfig cfg = g.cfg;
         if (body.contains("temperature") && body["temperature"].is_number()) cfg.temp = body["temperature"].get<float>();
@@ -3323,12 +3504,13 @@ static bool serve_completions(ServeGenCtx & g, const nlohmann::ordered_json & bo
                 }
             }
             if (hit) break;
-            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
-            if (llama_decode(g.ctx, batch) != 0) {
+            gen_toks.push_back(id);
+            if (!g.slots.decode_token(*slot, id)) {
                 err = "decode error";
                 return false;
             }
         }
+        g.slots.extend(*slot, gen_toks);
         out.msg.role = "assistant";
         out.msg.content = generated;
         out.finish_reason = length_hit ? "length" : "stop";
@@ -3359,23 +3541,35 @@ static bool serve_embeddings(ServeGenCtx & g, const nlohmann::ordered_json & bod
         const int32_t n_embd = llama_model_n_embd(g.model);
         nlohmann::ordered_json data = nlohmann::ordered_json::array();
         int total = 0;
+        const llama_seq_id eseq = g.slots.emb_seq();
         for (size_t i = 0; i < inputs.size(); i++) {
             if (stop) break;
-            llama_memory_clear(g.mem, true);
+            if (!llama_memory_seq_rm(g.mem, eseq, -1, -1)) {
+                err = "embedding cache clear failed";
+                return false;
+            }
             std::vector<llama_token> toks = serve_tokenize(g.vocab, inputs[i], false);
             if (toks.empty()) {
                 err = "input tokenization failed";
                 return false;
             }
-            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(toks.data()),
-                                                    static_cast<int32_t>(toks.size()));
+            llama_batch batch = llama_batch_init(static_cast<int32_t>(toks.size()), 0, 1);
+            batch.n_tokens = static_cast<int32_t>(toks.size());
+            for (size_t j = 0; j < toks.size(); j++) {
+                batch.token[j] = toks[j];
+                batch.pos[j] = static_cast<llama_pos>(j);
+                batch.n_seq_id[j] = 1;
+                batch.seq_id[j][0] = eseq;
+                batch.logits[j] = 1;
+            }
             llama_set_embeddings(g.ctx, true);
             const int rc = is_encoder ? llama_encode(g.ctx, batch) : llama_decode(g.ctx, batch);
+            llama_batch_free(batch);
             if (rc != 0) {
                 err = "embedding decode failed";
                 return false;
             }
-            const float * embd = llama_get_embeddings_seq(g.ctx, 0);
+            const float * embd = llama_get_embeddings_seq(g.ctx, eseq);
             if (!embd) embd = llama_get_embeddings(g.ctx);
             if (!embd) {
                 err = "embeddings unavailable for this model";
@@ -4873,6 +5067,8 @@ static int cmd_serve(CliArgs & cli) {
             if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.n_threads); }
         } else if (a == "--api-key") {
             if (i + 1 < cli.sub_args.size()) cli.api_key = cli.sub_args[++i];
+        } else if (a == "--slots") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.slots); }
         } else if (!a.empty() && a[0] != '-' && cli.model.empty()) {
             cli.model = a;
         } else {
@@ -4931,6 +5127,9 @@ static int cmd_serve(CliArgs & cli) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    if (cli.slots < 1) cli.slots = 1;
+    if (cli.slots > 64) cli.slots = 64;
+
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = static_cast<uint32_t>(cfg.n_ctx > 0 ? cfg.n_ctx : 4096);
     cparams.n_batch = cparams.n_ctx;
@@ -4939,6 +5138,8 @@ static int cmd_serve(CliArgs & cli) {
     cparams.type_k = cfg.type_k;
     cparams.type_v = cfg.type_v;
     cparams.embeddings = true;
+    cparams.n_seq_max = static_cast<uint32_t>(cli.slots) + 1;
+    cparams.kv_unified = true;
     LlamaContext ctx(llama_init_from_model(model, cparams));
     if (!ctx) {
         fprintf(stderr, "\033[31merror: failed to create context\033[0m\n");
@@ -4961,6 +5162,7 @@ static int cmd_serve(CliArgs & cli) {
     g.tmpls = tmpls.get();
     g.cfg = cfg;
     g.model_id = friendly;
+    g.slots.init(ctx.get(), mem, cli.slots);
 
     McpHost mcp_host;
     if (!load_mcp_servers().empty()) {
@@ -5291,7 +5493,7 @@ static int cmd_serve(CliArgs & cli) {
         res.set_content(out.dump(), "application/json");
     });
 
-    fprintf(stderr, "\033[1;32manvil serve\033[0m  model=%s  %s:%d\n", g.model_id.c_str(), cli.host.c_str(), cli.port);
+    fprintf(stderr, "\033[1;32manvil serve\033[0m  model=%s  %s:%d  slots=%d\n", g.model_id.c_str(), cli.host.c_str(), cli.port, cli.slots);
     fprintf(stderr, "  GET  /v1/models\n");
     fprintf(stderr, "  POST /v1/chat/completions  (OpenAI, stream + non-stream, tools)\n");
     fprintf(stderr, "  POST /v1/messages          (Anthropic, stream + non-stream, tools)\n");
@@ -5809,6 +6011,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             mcp_host.connect_all();
             mcp_active = mcp_host.tool_count() > 0;
             if (mcp_active) {
+                mcp_g.slots.init(ctx.get(), mem, 1);
                 fprintf(stderr, "  mcp tools  : \033[32m%zu available\033[0m\n", mcp_host.tool_count());
             } else {
                 fprintf(stderr, "  mcp tools  : \033[33mnone available\033[0m\n");
@@ -5824,7 +6027,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             body["messages"] = chat_history_to_oai(history);
             body["tools"] = mcp_tools_to_oai(mcp_host.all_tools());
             body["stream"] = false;
-            llama_memory_clear(mem, true);
+            mcp_g.slots.reset_all();
             prev_tokens.clear();
             ServeResult out;
             std::string err;
