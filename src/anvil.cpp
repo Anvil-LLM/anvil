@@ -1,6 +1,8 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -20,15 +22,24 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <functional>
+#include <mutex>
 #ifdef __APPLE__
 #include <IOKit/IOKitLib.h>
 #include <sys/sysctl.h>
+#include <mach-o/dyld.h>
 #endif
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <io.h>
 #else
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <glob.h>
 #endif
 #ifdef _WIN32
@@ -61,12 +72,20 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.5.2";
+inline const char * ANVIL_VERSION = "0.6.0";
 inline const int    CONFIG_VERSION = 2;
 
-inline std::atomic<bool> g_interrupted{false};
+inline volatile sig_atomic_t g_interrupted = 0;
 inline void anvil_signal_handler(int) {
-    g_interrupted.store(true, std::memory_order_relaxed);
+    g_interrupted = 1;
+}
+
+inline void install_sigint(void (*handler)(int), bool restart = true) {
+    struct sigaction sa {};
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = restart ? SA_RESTART : 0;
+    sigaction(SIGINT, &sa, nullptr);
 }
 
 struct LlamaModel {
@@ -563,6 +582,7 @@ struct MarkdownStream {
 struct ChatMessage {
     std::string role;
     std::string content;
+    std::string image_path;
 };
 
 struct GenStats {
@@ -602,12 +622,22 @@ struct CliArgs {
     bool        invalid     = false;
     bool        version     = false;
     bool        setup       = false;
+    bool        resume      = false;
+    bool        non_interactive = false;
     std::string type_k;
     std::string type_v;
     std::string system_prompt;
     std::string prompt;
     std::string grammar;
+    std::string mmproj;
+    std::string rag_dir;
+    std::string image;
+    std::string token;
     int         max_tokens  = -1;
+    int         port        = 8080;
+    std::string host        = "127.0.0.1";
+    int         bench_tokens = 32;
+    int         bench_ctx   = 0;
 };
 
 inline constexpr int   MAX_CTX      = INT32_MAX;
@@ -631,6 +661,10 @@ void print_usage() {
     printf("  anvil rm <name> [--yes]         Unregister a model\n");
     printf("  anvil pull ollama:<name>[:tag]  Pull from the Ollama registry\n");
     printf("  anvil pull hf:<repo>[:file]     Pull from HuggingFace\n");
+    printf("  anvil serve [--port <n>]        OpenAI-compatible API server\n");
+    printf("  anvil bench <model> [options]   TurboQuant KV benchmark\n");
+    printf("  anvil doctor                    System diagnostics\n");
+    printf("  anvil self-update               Update to the latest release\n");
     printf("  anvil --help                    Show this help\n");
     printf("  anvil --version                 Show version\n");
     printf("  anvil --setup                   Re-run hardware setup TUI\n\n");
@@ -651,6 +685,11 @@ void print_usage() {
     printf("  -s, --system <text>      System prompt\n");
     printf("  -p, --prompt <text>      User prompt (non-interactive mode)\n");
     printf("  -n, --max-tokens <n>     Max tokens to generate (default: unlimited)\n");
+    printf("      --mmproj <file>       Vision projector (multimodal models)\n");
+    printf("      --image <file>        Attach an image (single-shot mode)\n");
+    printf("      --rag <dir>           Retrieve context from a folder of documents\n");
+    printf("      --resume              Resume the latest session for this model\n");
+    printf("      --token <tok>         HF token for gated repos (or HF_TOKEN env)\n");
     printf("      --save                Persist CLI overrides into the model's profile\n\n");
     printf("Model registry:\n");
     printf("  <model> may be a friendly name (registered via pull/import) or a file path.\n");
@@ -701,7 +740,8 @@ CliArgs parse_args(int argc, char ** argv) {
     if (argc < 2) { a.invalid = true; a.help = true; return a; }
 
     const std::string first = argv[1];
-    if (first == "models" || first == "profile" || first == "rm" || first == "pull") {
+    if (first == "models" || first == "profile" || first == "rm" || first == "pull" ||
+        first == "serve" || first == "doctor" || first == "self-update" || first == "bench") {
         a.sub = first;
         for (int i = 2; i < argc; i++) a.sub_args.emplace_back(argv[i]);
         return a;
@@ -746,6 +786,21 @@ CliArgs parse_args(int argc, char ** argv) {
         else if ((arg == "-p" || arg == "--prompt") && i + 1 < argc)      { a.prompt = argv[++i]; }
         else if ((arg == "-n" || arg == "--max-tokens") && i + 1 < argc) {
             set_int(arg, argv[++i], -1, INT32_MAX, a.max_tokens, a);
+        }
+        else if (arg == "--mmproj" && i + 1 < argc)                       { a.mmproj = argv[++i]; }
+        else if (arg == "--rag" && i + 1 < argc)                          { a.rag_dir = argv[++i]; }
+        else if (arg == "--resume")                                       { a.resume = true; }
+        else if (arg == "--token" && i + 1 < argc)                        { a.token = argv[++i]; }
+        else if (arg == "--image" && i + 1 < argc)                        { a.image = argv[++i]; }
+        else if (arg == "--port" && i + 1 < argc) {
+            set_int(arg, argv[++i], 1, 65535, a.port, a);
+        }
+        else if (arg == "--host" && i + 1 < argc)                         { a.host = argv[++i]; }
+        else if (arg == "--bench-tokens" && i + 1 < argc) {
+            set_int(arg, argv[++i], 1, 1000000, a.bench_tokens, a);
+        }
+        else if (arg == "--bench-ctx" && i + 1 < argc) {
+            set_int(arg, argv[++i], 1, MAX_CTX, a.bench_ctx, a);
         }
         else if (arg[0] != '-')                                           { a.model = arg; }
         else {
@@ -1140,6 +1195,119 @@ static std::string slugify(const std::string & s) {
     while (out.size() > 1 && out.back() == '-') out.pop_back();
     if (out.empty()) out = "model";
     return out;
+}
+
+inline std::string history_path()  { return config_dir() + "/history"; }
+inline std::string presets_dir()  { return config_dir() + "/presets"; }
+
+static std::vector<std::string> load_history_lines() {
+    std::vector<std::string> out;
+    std::ifstream f(history_path());
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+
+static void append_history_line(const std::string & s) {
+    if (s.empty()) return;
+    std::ofstream f(history_path(), std::ios::app);
+    if (f) f << s << "\n";
+}
+
+static std::string load_preset_text(const std::string & name) {
+    std::string n = name;
+    if (n.size() > 1 && n[0] == '@') n = n.substr(1);
+    for (const char * ext : {".txt", ".md", ""}) {
+        const std::string p = presets_dir() + "/" + n + ext;
+        std::ifstream f(p);
+        if (f) return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    return "";
+}
+
+static std::vector<std::string> list_presets() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(presets_dir(), ec)) return out;
+    for (const auto & de : std::filesystem::directory_iterator(presets_dir(), ec)) {
+        if (!de.is_regular_file(ec)) continue;
+        std::string n = de.path().filename().string();
+        for (const char * ext : {".txt", ".md"}) {
+            const size_t l = std::strlen(ext);
+            if (n.size() > l && n.compare(n.size() - l, l, ext) == 0) {
+                n = n.substr(0, n.size() - l);
+                break;
+            }
+        }
+        out.push_back(n);
+    }
+    return out;
+}
+
+static std::string session_dir_for(const std::string & model) {
+    const std::string dir = sessions_dir() + "/" + slugify(model);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static std::string new_session_path(const std::string & model) {
+    const std::string dir = session_dir_for(model);
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[64];
+    if (!std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", std::localtime(&t))) {
+        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(t));
+    }
+    return dir + "/" + buf + ".jsonl";
+}
+
+static std::string latest_session_for(const std::string & model) {
+    const std::string dir = sessions_dir() + "/" + slugify(model);
+    std::error_code ec;
+    std::string best;
+    std::filesystem::file_time_type best_t{};
+    if (!std::filesystem::exists(dir, ec)) return "";
+    for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
+        if (!de.is_regular_file(ec) || de.path().extension() != ".jsonl") continue;
+        const auto ft = de.last_write_time(ec);
+        if (best.empty() || ft > best_t) { best = de.path().string(); best_t = ft; }
+    }
+    return best;
+}
+
+static bool save_session(const std::string & path, const std::vector<ChatMessage> & msgs) {
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) return false;
+    for (const auto & m : msgs) {
+        nlohmann::json j;
+        j["role"] = m.role;
+        j["content"] = m.content;
+        if (!m.image_path.empty()) j["image"] = m.image_path;
+        f << j.dump() << "\n";
+    }
+    f.flush();
+    return f.good();
+}
+
+static bool load_session(const std::string & path, std::vector<ChatMessage> & msgs) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(line);
+            ChatMessage m;
+            if (j.contains("role")) m.role = j["role"].get<std::string>();
+            if (j.contains("content")) m.content = j["content"].get<std::string>();
+            if (j.contains("image")) m.image_path = j["image"].get<std::string>();
+            msgs.push_back(std::move(m));
+        } catch (const nlohmann::json::exception &) {}
+    }
+    return !msgs.empty();
 }
 
 bool save_models(const std::vector<ModelEntry> & models);
@@ -1632,7 +1800,7 @@ std::string capture(const std::string & cmd) {
     const std::string tmp = pull_tmp_path();
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
-    const std::string full = cmd + " > \"" + tmp + "\" 2>/dev/null";
+    const std::string full = "{ " + cmd + "; } > \"" + tmp + "\" 2>/dev/null";
     std::string out;
     if (system(full.c_str()) == 0) {
         std::ifstream f(tmp, std::ios::binary);
@@ -1642,10 +1810,18 @@ std::string capture(const std::string & cmd) {
     return out;
 }
 
+inline std::string g_hf_token;
+static volatile sig_atomic_t g_serve_stop = 0;
+
+static std::string auth_flag() {
+    if (g_hf_token.empty()) return "";
+    return " -H \"Authorization: Bearer " + g_hf_token + "\"";
+}
+
 std::string http_get(const std::string & url, const std::string & extra_flags = "") {
-    std::string out = capture("curl -fsSL --max-time 60 " + extra_flags + " \"" + url + "\"");
+    std::string out = capture("curl -fsSL --max-time 60 " + extra_flags + auth_flag() + " \"" + url + "\"");
     if (out.empty()) {
-        out = capture("wget -qO- --timeout=60 \"" + url + "\"");
+        out = capture("wget -qO- --timeout=60 --header=\"Authorization: Bearer " + g_hf_token + "\" \"" + url + "\"");
     }
     return out;
 }
@@ -1664,8 +1840,8 @@ int http_download(const std::string & url, const std::string & out_path,
         }
     }
 
-    std::string cmd = "curl --fail --location --progress-bar --retry 3 --retry-delay 2 "
-                      "--connect-timeout 20 --continue-at - -o \"" +
+    std::string cmd = std::string("curl --fail --location --progress-bar --retry 3 --retry-delay 2 ") +
+                      "--connect-timeout 20 --continue-at - " + auth_flag() + " -o \"" +
                       part + "\" \"" + url + "\"";
     const int rc = system(cmd.c_str());
     if (rc != 0) {
@@ -2723,6 +2899,1125 @@ AnvilConfig run_setup_tui(const HWInfo & hw, int max_ctx) {
 int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
              std::vector<ModelEntry> & models);
 
+#ifdef _WIN32
+typedef SOCKET anvil_sock_t;
+#define ANVIL_SOCK_INVALID INVALID_SOCKET
+#define ANVIL_SOCK_CLOSE closesocket
+#define ANVIL_SOCK_ERR SOCKET_ERROR
+#else
+typedef int anvil_sock_t;
+#define ANVIL_SOCK_INVALID (-1)
+#define ANVIL_SOCK_CLOSE ::close
+#define ANVIL_SOCK_ERR (-1)
+#endif
+
+static bool sock_init() {
+#ifdef _WIN32
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+#else
+    return true;
+#endif
+}
+
+static void sock_shutdown() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+static anvil_sock_t sock_listen(const std::string & host, int port) {
+#ifdef _WIN32
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return ANVIL_SOCK_INVALID;
+    BOOL one = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&one), sizeof(one));
+#else
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return ANVIL_SOCK_INVALID;
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (host.empty() || host == "0.0.0.0") {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    }
+    if (bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        ANVIL_SOCK_CLOSE(s);
+        return ANVIL_SOCK_INVALID;
+    }
+    if (listen(s, 16) != 0) {
+        ANVIL_SOCK_CLOSE(s);
+        return ANVIL_SOCK_INVALID;
+    }
+    return s;
+}
+
+static void sock_send(anvil_sock_t c, const std::string & data) {
+#ifdef _WIN32
+    send(c, data.data(), static_cast<int>(data.size()), 0);
+#else
+    size_t off = 0;
+    while (off < data.size()) {
+        const ssize_t n = ::send(c, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        off += static_cast<size_t>(n);
+    }
+#endif
+}
+
+static std::string sock_read_until(anvil_sock_t c, const std::string & term, size_t max) {
+    std::string buf;
+    char tmp[4096];
+    while (buf.size() < max) {
+        const int n = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
+        if (n <= 0) break;
+        buf.append(tmp, static_cast<size_t>(n));
+        if (buf.find(term) != std::string::npos) break;
+    }
+    return buf;
+}
+
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string body;
+    std::map<std::string, std::string> headers;
+};
+
+static bool parse_http_request(anvil_sock_t c, HttpRequest & req) {
+    const std::string head = sock_read_until(c, "\r\n\r\n", 1 << 20);
+    if (head.empty()) return false;
+    const size_t hdr_end = head.find("\r\n\r\n");
+    if (hdr_end == std::string::npos) return false;
+    const std::string header_block = head.substr(0, hdr_end);
+    std::istringstream hs(header_block);
+    std::string line;
+    std::getline(hs, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+    const size_t sp1 = line.find(' ');
+    const size_t sp2 = line.rfind(' ');
+    if (sp1 == std::string::npos || sp2 == std::string::npos || sp2 <= sp1) return false;
+    req.method = line.substr(0, sp1);
+    req.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    while (std::getline(hs, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string k = line.substr(0, colon);
+        std::string v = line.substr(colon + 1);
+        while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+        for (char & ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        req.headers[k] = v;
+    }
+    const auto it = req.headers.find("content-length");
+    size_t clen = 0;
+    if (it != req.headers.end()) {
+        char * end = nullptr;
+        const unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
+        if (end != it->second.c_str() && v < (1ULL << 30)) clen = static_cast<size_t>(v);
+    }
+    if (clen > 0) {
+        size_t have = head.size() > hdr_end + 4 ? head.size() - hdr_end - 4 : 0;
+        req.body = head.substr(hdr_end + 4);
+        while (req.body.size() < clen) {
+            char tmp[4096];
+            const int n = static_cast<int>(recv(c, tmp, sizeof(tmp), 0));
+            if (n <= 0) break;
+            req.body.append(tmp, static_cast<size_t>(n));
+        }
+        req.body.resize(clen);
+        (void)have;
+    }
+    return true;
+}
+
+static std::string http_status_line(int code) {
+    switch (code) {
+        case 200: return "HTTP/1.1 200 OK";
+        case 400: return "HTTP/1.1 400 Bad Request";
+        case 404: return "HTTP/1.1 404 Not Found";
+        case 405: return "HTTP/1.1 405 Method Not Allowed";
+        case 500: return "HTTP/1.1 500 Internal Server Error";
+        case 503: return "HTTP/1.1 503 Service Unavailable";
+        default:  return "HTTP/1.1 500 Internal Server Error";
+    }
+}
+
+static void http_reply(anvil_sock_t c, int code, const std::string & ctype,
+                       const std::string & body, bool cors) {
+    std::string out = http_status_line(code) + "\r\n";
+    out += "Content-Type: " + ctype + "\r\n";
+    out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    out += "Access-Control-Allow-Origin: *\r\n";
+    out += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+    out += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+    out += "Cache-Control: no-store\r\n";
+    out += "Connection: close\r\n\r\n";
+    out += body;
+    (void)cors;
+    sock_send(c, out);
+}
+
+static void http_reply_sse(anvil_sock_t c, const std::string & event) {
+    std::string out = "data: " + event + "\n\n";
+    sock_send(c, out);
+}
+
+static int64_t now_unix() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string token_to_str(const llama_vocab * vocab, llama_token token);
+static llama_sampler * build_sampler_chain(const llama_vocab * vocab, const AnvilConfig & cfg,
+        bool grammar_active, const std::string & grammar_src);
+static std::vector<llama_token> tokenize_render(const llama_vocab * vocab, const std::string & text);
+
+static bool complete_stream(anvil_sock_t c, llama_context * ctx, llama_model * model,
+                            const llama_vocab * vocab, llama_sampler * smpl,
+                            llama_memory_t mem, const std::vector<ChatMessage> & history,
+                            const char * tmpl, bool add_bos, llama_token bos_id,
+                            int max_tokens, std::string & out_text, GenStats & stats,
+                            const volatile sig_atomic_t & stop) {
+    std::vector<llama_chat_message> msgs;
+    msgs.reserve(history.size());
+    for (const auto & m : history) msgs.push_back({m.role.c_str(), m.content.c_str()});
+    int32_t n = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true, nullptr, 0);
+    if (n < 0) return false;
+    std::string formatted(static_cast<size_t>(n) + 1, '\0');
+    const int32_t m = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                                formatted.data(), static_cast<int32_t>(formatted.size()));
+    if (m < 0) return false;
+    formatted.resize(static_cast<size_t>(m));
+    std::vector<llama_token> toks = tokenize_render(vocab, formatted);
+    if (toks.empty()) return false;
+    std::vector<llama_token> full;
+    full.reserve(toks.size() + 1);
+    if (add_bos && (toks.empty() || toks[0] != bos_id)) full.push_back(bos_id);
+    full.insert(full.end(), toks.begin(), toks.end());
+    const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
+    for (size_t i = 0; i < full.size(); i += static_cast<size_t>(chunk)) {
+        const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - i);
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + i),
+                                                static_cast<int32_t>(nn));
+        if (llama_decode(ctx, batch) != 0) return false;
+    }
+    llama_sampler_reset(smpl);
+    Utf8Buffer ub;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        if (stop) break;
+        if (max_tokens > 0 && stats.tokens_generated >= max_tokens) break;
+        const llama_token id = llama_sampler_sample(smpl, ctx, -1);
+        if (llama_vocab_is_eog(vocab, id)) break;
+        const std::string piece = token_to_str(vocab, id);
+        const std::string printable = ub.feed(piece);
+        if (!printable.empty()) {
+            out_text += printable;
+            nlohmann::json j;
+            j["id"] = "chatcmpl-anvil";
+            j["object"] = "chat.completion.chunk";
+            j["created"] = now_unix();
+            j["model"] = "anvil";
+            j["choices"] = nlohmann::json::array();
+            nlohmann::json ch;
+            ch["index"] = 0;
+            ch["delta"] = {{"content", printable}};
+            ch["finish_reason"] = nullptr;
+            j["choices"].push_back(ch);
+            http_reply_sse(c, j.dump());
+        }
+        stats.tokens_generated++;
+        llama_sampler_accept(smpl, id);
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+        if (llama_decode(ctx, batch) != 0) return false;
+    }
+    const std::string tail = ub.flush();
+    if (!tail.empty()) {
+        out_text += tail;
+        nlohmann::json j;
+        j["id"] = "chatcmpl-anvil";
+        j["object"] = "chat.completion.chunk";
+        j["created"] = now_unix();
+        j["model"] = "anvil";
+        j["choices"] = nlohmann::json::array();
+        nlohmann::json ch;
+        ch["index"] = 0;
+        ch["delta"] = {{"content", tail}};
+        ch["finish_reason"] = nullptr;
+        j["choices"].push_back(ch);
+        http_reply_sse(c, j.dump());
+    }
+    nlohmann::json fin;
+    fin["id"] = "chatcmpl-anvil";
+    fin["object"] = "chat.completion.chunk";
+    fin["created"] = now_unix();
+    fin["model"] = "anvil";
+    fin["choices"] = nlohmann::json::array();
+    nlohmann::json fc;
+    fc["index"] = 0;
+    fc["delta"] = nlohmann::json::object();
+    fc["finish_reason"] = stats.tokens_generated >= max_tokens && max_tokens > 0 ? "length" : "stop";
+    fin["choices"].push_back(fc);
+    http_reply_sse(c, fin.dump());
+    http_reply_sse(c, "[DONE]");
+    stats.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+static bool complete_json(llama_context * ctx, llama_model * model,
+                          const llama_vocab * vocab, llama_sampler * smpl,
+                          llama_memory_t mem, const std::vector<ChatMessage> & history,
+                          const char * tmpl, bool add_bos, llama_token bos_id,
+                          int max_tokens, std::string & out_text, GenStats & stats,
+                          const volatile sig_atomic_t & stop) {
+    std::vector<llama_chat_message> msgs;
+    msgs.reserve(history.size());
+    for (const auto & m : history) msgs.push_back({m.role.c_str(), m.content.c_str()});
+    int32_t n = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true, nullptr, 0);
+    if (n < 0) return false;
+    std::string formatted(static_cast<size_t>(n) + 1, '\0');
+    const int32_t m = llama_chat_apply_template(tmpl, msgs.data(), msgs.size(), true,
+                                                formatted.data(), static_cast<int32_t>(formatted.size()));
+    if (m < 0) return false;
+    formatted.resize(static_cast<size_t>(m));
+    std::vector<llama_token> toks = tokenize_render(vocab, formatted);
+    if (toks.empty()) return false;
+    std::vector<llama_token> full;
+    full.reserve(toks.size() + 1);
+    if (add_bos && (toks.empty() || toks[0] != bos_id)) full.push_back(bos_id);
+    full.insert(full.end(), toks.begin(), toks.end());
+    const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
+    for (size_t i = 0; i < full.size(); i += static_cast<size_t>(chunk)) {
+        const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - i);
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + i),
+                                                static_cast<int32_t>(nn));
+        if (llama_decode(ctx, batch) != 0) return false;
+    }
+    llama_sampler_reset(smpl);
+    Utf8Buffer ub;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        if (stop) break;
+        if (max_tokens > 0 && stats.tokens_generated >= max_tokens) break;
+        const llama_token id = llama_sampler_sample(smpl, ctx, -1);
+        if (llama_vocab_is_eog(vocab, id)) break;
+        const std::string piece = token_to_str(vocab, id);
+        const std::string printable = ub.feed(piece);
+        if (!printable.empty()) out_text += printable;
+        stats.tokens_generated++;
+        llama_sampler_accept(smpl, id);
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+        if (llama_decode(ctx, batch) != 0) return false;
+    }
+    out_text += ub.flush();
+    stats.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+
+static int cmd_bench(CliArgs & cli) {
+    for (size_t i = 0; i < cli.sub_args.size(); i++) {
+        const std::string & a = cli.sub_args[i];
+        if ((a == "--ctx" || a == "-c") && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], cli.bench_ctx);
+        } else if (a == "--tokens" && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], cli.bench_tokens);
+        } else if (a == "--prompt" && i + 1 < cli.sub_args.size()) {
+            cli.prompt = cli.sub_args[++i];
+        } else if (a == "--ngl" || a == "--n-gpu-layers") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.ngl); }
+        } else if (!a.empty() && a[0] != '-' && cli.model.empty()) {
+            cli.model = a;
+        } else {
+            fprintf(stderr, "bench: unknown option '%s'\n", a.c_str());
+            return 1;
+        }
+    }
+    if (cli.model.empty()) {
+        fprintf(stderr, "usage: anvil bench <model> [--ctx <n>] [--tokens <n>] [--prompt <text>]\n");
+        return 1;
+    }
+    std::string path, friendly;
+    if (!resolve_model_arg(cli.model, path, friendly)) {
+        fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
+                cli.model.c_str());
+        return 1;
+    }
+    if (!validate_gguf(path)) {
+        fprintf(stderr, "\033[31merror: %s\033[0m\n", gguf_check_error(path).c_str());
+        return 1;
+    }
+    cli.model = path;
+
+    const HWInfo hw = probe_hw();
+    const ModelMeta meta = read_model_meta(path);
+    const int max_ctx = static_cast<int>(meta.trained_ctx);
+    AnvilConfig base = config_exists() ? load_config() : AnvilConfig{};
+    if (cli.ngl >= 0) base.ngl = cli.ngl;
+    else if (base.ngl < 0) base.ngl = derive_ngl(hw);
+    int ctx_n = cli.bench_ctx > 0 ? cli.bench_ctx : (max_ctx > 0 ? max_ctx : 2048);
+
+    LlamaBackend backend;
+    fprintf(stderr, "Loading model: %s ...\n", path.c_str());
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = base.ngl;
+    LlamaModel model(llama_model_load_from_file(path.c_str(), mparams));
+    if (!model) {
+        fprintf(stderr, "\033[31merror: failed to load model '%s'\033[0m\n", path.c_str());
+        return 1;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const std::string prompt = cli.prompt.empty()
+        ? "The quick brown fox jumps over the lazy dog. What does that say about"
+        : cli.prompt;
+    std::vector<llama_token> prompt_toks = tokenize_render(vocab, prompt);
+    if (prompt_toks.empty()) {
+        fprintf(stderr, "\033[31merror: prompt tokenization failed\033[0m\n");
+        return 1;
+    }
+
+    const int n_tokens = cli.bench_tokens > 0 ? cli.bench_tokens : 32;
+    struct Pair { const char * name; ggml_type k; ggml_type v; };
+    const Pair pairs[] = {
+        { "f16/f16        ", GGML_TYPE_F16,       GGML_TYPE_F16      },
+        { "q8_0/turbo3    ", GGML_TYPE_Q8_0,      GGML_TYPE_TURBO3_0 },
+        { "turbo4/turbo3  ", GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO3_0 },
+        { "turbo4/turbo2  ", GGML_TYPE_TURBO4_0,  GGML_TYPE_TURBO2_0 },
+    };
+    const int n_pairs = static_cast<int>(sizeof(pairs) / sizeof(pairs[0]));
+
+    printf("\n\033[1;36m── TurboQuant KV Benchmark ──\033[0m\n");
+    printf("  model   : %s\n", path.c_str());
+    printf("  ctx     : %d tokens\n", ctx_n);
+    printf("  prompt  : %zu tokens | generate %d\n\n", prompt_toks.size(), n_tokens);
+    printf("%-18s %-12s %-10s %-8s %s\n", "KV CONFIG", "TOK/S", "TOKENS", "FIRST", "RESULT");
+
+    for (int p = 0; p < n_pairs; p++) {
+        AnvilConfig cfg = base;
+        cfg.type_k = pairs[p].k;
+        cfg.type_v = pairs[p].v;
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = static_cast<uint32_t>(ctx_n);
+        cparams.n_batch = static_cast<uint32_t>(ctx_n);
+        cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
+        cparams.flash_attn_type = cfg.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.type_k = cfg.type_k;
+        cparams.type_v = cfg.type_v;
+        const auto t0 = std::chrono::steady_clock::now();
+        LlamaContext ctx(llama_init_from_model(model, cparams));
+        if (!ctx) {
+            printf("%-18s %-12s %-10s %-8s \033[31mcontext creation failed\033[0m\n",
+                   pairs[p].name, "-", "-", "-");
+            continue;
+        }
+        const double ctx_sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        llama_memory_t mem = llama_get_memory(ctx);
+        LlamaSampler smpl(build_sampler_chain(vocab, cfg, false, ""));
+        if (!smpl) {
+            printf("%-18s %-12s %-10s %-8s \033[31msampler failed\033[0m\n",
+                   pairs[p].name, "-", "-", "-");
+            continue;
+        }
+        std::vector<llama_token> full = prompt_toks;
+        const llama_token bos = llama_vocab_bos(vocab);
+        if (llama_vocab_get_add_bos(vocab) && (full.empty() || full[0] != bos)) {
+            full.insert(full.begin(), bos);
+        }
+        bool ok = true;
+        const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
+        for (size_t i = 0; i < full.size(); i += static_cast<size_t>(chunk)) {
+            const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - i);
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + i),
+                                                    static_cast<int32_t>(nn));
+            if (llama_decode(ctx, batch) != 0) { ok = false; break; }
+        }
+        if (!ok) {
+            printf("%-18s %-12s %-10s %-8s \033[31mdecode failed\033[0m\n",
+                   pairs[p].name, "-", "-", "-");
+            continue;
+        }
+        llama_sampler_reset(smpl.get());
+        const auto g0 = std::chrono::steady_clock::now();
+        int gen = 0;
+        std::atomic<bool> no_stop{false};
+        while (gen < n_tokens) {
+            const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
+            if (llama_vocab_is_eog(vocab, id)) break;
+            llama_sampler_accept(smpl.get(), id);
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+            if (llama_decode(ctx, batch) != 0) break;
+            gen++;
+        }
+        const double gen_sec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - g0).count();
+        const double tps = gen_sec > 0 ? gen / gen_sec : 0.0;
+        printf("%-18s %-12.1f %-10d %-8.2f %s\n",
+               pairs[p].name, tps, gen, ctx_sec,
+               gen >= n_tokens ? "\033[32mok\033[0m" : "\033[33mearly stop\033[0m");
+        (void)no_stop;
+    }
+    printf("\n");
+    return 0;
+}
+
+static void doctor_check(bool ok, const char * name, const std::string & detail) {
+    printf("  %s %s%s\n", ok ? "\033[32m[ OK ]\033[0m" : "\033[31m[FAIL]\033[0m",
+           name, detail.empty() ? "" : ("  " + detail).c_str());
+}
+
+static int cmd_doctor(const std::vector<std::string> & args) {
+    (void)args;
+    printf("\n\033[1;36m── anvil doctor ──\033[0m\n");
+    int failures = 0;
+    auto check = [&](bool ok, const char * name, const std::string & detail = "") {
+        doctor_check(ok, name, detail);
+        if (!ok) failures++;
+    };
+
+    const HWInfo hw = probe_hw();
+    std::string hwline = hw.cpu;
+    if (!hw.arch.empty()) hwline += " | " + hw.arch;
+    check(!hw.cpu.empty(), "hardware probe", hwline);
+    check(hw.ram_bytes > 0, "memory detect",
+          std::to_string(hw.ram_bytes / (1024ULL * 1024 * 1024)) + " GB");
+    check(hw.cpu_threads > 0, "cpu threads", std::to_string(hw.cpu_threads));
+    check(!hw.gpus.empty() || hw.apple_silicon, "gpu detect",
+          hw.gpus.empty() ? (hw.apple_silicon ? "Apple GPU" : "CPU only") : hw.gpus[0].name);
+
+    check(config_exists(), "config.json exists", config_path());
+    AnvilConfig cfg = load_config();
+    check(cfg.version == CONFIG_VERSION, "config.json version",
+          "v" + std::to_string(cfg.version));
+
+    std::vector<ModelEntry> models = load_models();
+    check(true, "models.json readable",
+          std::to_string(models.size()) + " registered model(s)");
+    int bad = 0;
+    uint64_t total_bytes = 0;
+    for (const auto & m : models) {
+        const bool exists = std::filesystem::exists(m.path);
+        const bool gguf = exists && validate_gguf(m.path);
+        if (!exists || !gguf) bad++;
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(m.path, ec);
+        if (!ec) total_bytes += sz;
+    }
+    check(bad == 0, "model files present + valid GGUF",
+          std::to_string(models.size() - static_cast<size_t>(bad)) + "/" + std::to_string(models.size()) + " ok");
+
+    std::error_code spc;
+    const auto space = std::filesystem::space(config_dir(), spc);
+    check(!spc, "disk space",
+          format_size(space.available) + " free in " + config_dir());
+
+    {
+        const std::string probe = capture("which curl 2>/dev/null || which wget 2>/dev/null");
+        check(!probe.empty(), "download tool (curl/wget)");
+    }
+    {
+        const std::string body = http_get("https://huggingface.co/api/models/Qwen/Qwen3.6-27B", "--max-time 10");
+        check(!body.empty(), "network reachability (huggingface.co)");
+    }
+    check(llama_supports_gpu_offload() || hw.apple_silicon, "gpu offload backend",
+          llama_supports_gpu_offload() ? "available" : "CPU only");
+
+    printf("\n  %s\n\n", failures == 0
+        ? "\033[1;32mAll checks passed.\033[0m"
+        : (std::string("\033[1;31m") + std::to_string(failures) + " check(s) failed.\033[0m").c_str());
+    return failures == 0 ? 0 : 1;
+}
+
+static std::string current_exe_path() {
+    char buf[4096];
+#ifdef _WIN32
+    const DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) return std::string(buf, n);
+#elif defined(__APPLE__)
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) == 0) return std::string(buf);
+#else
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return std::string(buf);
+    }
+#endif
+    return "";
+}
+
+static std::string asset_name_for_platform(const std::string & os, const std::string & arch) {
+    if (os == "linux" && arch == "x86_64")   return "anvil-linux-x86_64";
+    if (os == "linux" && arch == "aarch64")  return "anvil-linux-aarch64";
+    if (os == "macos" && arch == "aarch64")  return "anvil-macos-aarch64";
+    if (os == "macos" && arch == "x86_64")   return "anvil-macos-x86_64";
+    if (os == "windows")                     return "anvil-windows-x86_64.exe";
+    return "";
+}
+
+static int cmd_self_update(const std::vector<std::string> & args) {
+    (void)args;
+    const std::string url = "https://api.github.com/repos/gondaliyashreyan1/Anvil/releases/latest";
+    const std::string body = http_get(url);
+    if (body.empty()) {
+        fprintf(stderr, "\033[31merror: could not reach GitHub releases API\033[0m\n");
+        return 1;
+    }
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(body);
+    } catch (const nlohmann::json::exception &) {
+        fprintf(stderr, "\033[31merror: invalid GitHub API response\033[0m\n");
+        return 1;
+    }
+    if (!j.contains("tag_name")) {
+        fprintf(stderr, "\033[31merror: no latest release found\033[0m\n");
+        return 1;
+    }
+    const std::string tag = j["tag_name"].get<std::string>();
+    const std::string want = asset_name_for_platform(probe_hw().os, probe_hw().arch);
+    if (want.empty()) {
+        fprintf(stderr, "\033[31merror: no prebuilt binary for this platform\033[0m\n");
+        return 1;
+    }
+    if (tag == std::string("v") + ANVIL_VERSION) {
+        printf("Already up to date (%s).\n", ANVIL_VERSION);
+        return 0;
+    }
+    if (!j.contains("assets") || !j["assets"].is_array()) {
+        fprintf(stderr, "\033[31merror: release has no assets\033[0m\n");
+        return 1;
+    }
+    std::string asset_url, digest;
+    for (const auto & a : j["assets"]) {
+        if (!a.is_object() || !a.contains("name")) continue;
+        const std::string nm = a["name"].get<std::string>();
+        if (nm != want) continue;
+        if (a.contains("browser_download_url")) asset_url = a["browser_download_url"].get<std::string>();
+        if (a.contains("digest") && a["digest"].is_string()) {
+            std::string d = a["digest"].get<std::string>();
+            if (d.rfind("sha256:", 0) == 0) digest = d.substr(7);
+        }
+        break;
+    }
+    if (asset_url.empty()) {
+        fprintf(stderr, "\033[31merror: asset '%s' not found in release %s\033[0m\n",
+                want.c_str(), tag.c_str());
+        return 1;
+    }
+    const std::string exe = current_exe_path();
+    if (exe.empty()) {
+        fprintf(stderr, "\033[31merror: could not determine current binary path\033[0m\n");
+        return 1;
+    }
+    printf("Updating %s -> %s\n", ANVIL_VERSION, tag.c_str());
+    printf("  downloading %s ...\n", want.c_str());
+    const std::string tmp = exe + ".new";
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    if (http_download(asset_url, tmp) != 0) {
+        fprintf(stderr, "\033[31merror: download failed\033[0m\n");
+        return 1;
+    }
+    if (!digest.empty()) {
+        const std::string actual = sha256_of(tmp);
+        if (actual.empty()) {
+            fprintf(stderr, "\033[33mwarning: no sha256 tool; skipping verification\033[0m\n");
+        } else if (actual != digest) {
+            fprintf(stderr, "\033[31merror: checksum mismatch (got %s, expected %s)\033[0m\n",
+                    actual.c_str(), digest.c_str());
+            std::filesystem::remove(tmp, ec);
+            return 1;
+        } else {
+            printf("  verified sha256:%s\n", digest.c_str());
+        }
+    } else {
+        fprintf(stderr, "\033[33mwarning: no digest in release metadata; skipping verification\033[0m\n");
+    }
+#ifdef _WIN32
+    std::filesystem::rename(tmp, exe, ec);
+#else
+    std::filesystem::permissions(tmp, std::filesystem::perms::owner_all |
+                                        std::filesystem::perms::group_read |
+                                        std::filesystem::perms::group_exec |
+                                        std::filesystem::perms::others_read |
+                                        std::filesystem::perms::others_exec, ec);
+    if (!ec) std::filesystem::rename(tmp, exe, ec);
+#endif
+    if (ec) {
+        fprintf(stderr, "\033[31merror: could not replace binary (%s). New binary kept at %s\033[0m\n",
+                ec.message().c_str(), tmp.c_str());
+        return 1;
+    }
+    printf("\033[32mUpdated to %s. Restart to use the new binary.\033[0m\n", tag.c_str());
+    return 0;
+}
+
+
+struct RagChunk {
+    std::string text;
+    std::vector<std::string> toks;
+    size_t start = 0;
+    size_t end = 0;
+};
+
+struct RagIndex {
+    std::vector<RagChunk> chunks;
+    std::map<std::string, double> idf;
+    std::map<std::string, std::vector<size_t>> postings;
+    bool empty() const { return chunks.empty(); }
+    size_t size() const { return chunks.size(); }
+
+    static std::vector<std::string> tokenize(const std::string & s) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (const unsigned char c : s) {
+            if (std::isalnum(c)) {
+                cur += static_cast<char>(std::tolower(c));
+            } else if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
+        }
+        if (!cur.empty()) out.push_back(cur);
+        return out;
+    }
+
+    void add_text(const std::string & text) {
+        std::vector<std::string> toks = tokenize(text);
+        if (toks.size() < 8) return;
+        const size_t CHUNK = 300;
+        for (size_t i = 0; i < toks.size(); i += CHUNK) {
+            const size_t n = std::min(CHUNK, toks.size() - i);
+            RagChunk c;
+            c.toks.assign(toks.begin() + static_cast<long>(i), toks.begin() + static_cast<long>(i + n));
+            std::set<std::string> uniq(c.toks.begin(), c.toks.end());
+            for (const auto & t : uniq) postings[t].push_back(chunks.size());
+            c.text = join_tokens(c.toks);
+            chunks.push_back(std::move(c));
+        }
+    }
+
+    static std::string join_tokens(const std::vector<std::string> & toks) {
+        std::string out;
+        for (size_t i = 0; i < toks.size(); i++) {
+            if (i > 0) out += ' ';
+            out += toks[i];
+        }
+        return out;
+    }
+
+    bool build_dir(const std::string & dir) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) return false;
+        std::vector<std::string> files;
+        for (const auto & de : std::filesystem::recursive_directory_iterator(dir, ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            const std::string ext = de.path().extension().string();
+            static const char * ok[] = {".txt", ".md", ".rst", ".json", ".yaml", ".yml",
+                                        ".py", ".cpp", ".c", ".h", ".hpp", ".rs", ".go",
+                                        ".js", ".ts", ".sh", ".toml", ".ini", ".csv", ".log"};
+            bool good = false;
+            for (const char * e : ok) {
+                if (ext == e) { good = true; break; }
+            }
+            if (good) files.push_back(de.path().string());
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto & f : files) {
+            std::ifstream in(f, std::ios::binary);
+            if (!in) continue;
+            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (content.size() > (8 << 20)) content.resize(8 << 20);
+            add_text(content);
+        }
+        if (chunks.empty()) return false;
+        for (const auto & [t, ps] : postings) {
+            const double df = static_cast<double>(ps.size());
+            idf[t] = std::log(static_cast<double>(chunks.size()) / (1.0 + df)) + 1.0;
+        }
+        return true;
+    }
+
+    std::vector<size_t> search(const std::string & query, size_t k) const {
+        const std::vector<std::string> qtoks = tokenize(query);
+        std::map<size_t, double> scores;
+        for (const auto & t : qtoks) {
+            const auto it = postings.find(t);
+            if (it == postings.end()) continue;
+            const auto itf = idf.find(t);
+            const double w = itf != idf.end() ? itf->second : 0.0;
+            for (const size_t ci : it->second) scores[ci] += w;
+        }
+        std::vector<std::pair<double, size_t>> ranked;
+        for (const auto & [ci, sc] : scores) ranked.push_back({sc, ci});
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto & a, const auto & b) { return a.first > b.first; });
+        std::vector<size_t> out;
+        const size_t n = std::min(k, ranked.size());
+        for (size_t i = 0; i < n; i++) out.push_back(ranked[i].second);
+        return out;
+    }
+
+    std::string context_for(const std::string & query, size_t k) const {
+        const std::vector<size_t> hits = search(query, k);
+        if (hits.empty()) return "";
+        std::string out;
+        for (const size_t ci : hits) {
+            out += chunks[ci].text;
+            out += "\n\n";
+        }
+        return out;
+    }
+};
+
+struct VisionSession {
+    mtmd_context * ctx = nullptr;
+    bool ok = false;
+
+    ~VisionSession() {
+        if (ctx) mtmd_free(ctx);
+    }
+
+    bool init(const std::string & mmproj, llama_model * model, const HWInfo & hw, int n_threads) {
+        if (ctx) return ok;
+        mtmd_context_params p = mtmd_context_params_default();
+        p.use_gpu = hw.apple_silicon || !hw.gpus.empty();
+        p.n_threads = n_threads > 0 ? n_threads : hw.cpu_threads;
+        p.warmup = true;
+        ctx = mtmd_init_from_file(mmproj.c_str(), model, p);
+        if (!ctx) return false;
+        ok = mtmd_support_vision(ctx);
+        return ok;
+    }
+
+    bool eval_image_turn(llama_context * lctx, const std::string & formatted,
+                         const std::string & image_path, llama_pos * new_past,
+                         int32_t n_batch) {
+        if (!ctx) return false;
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        if (!chunks) return false;
+        const auto bw = mtmd_helper_bitmap_init_from_file(ctx, image_path.c_str(), false);
+        if (!bw.bitmap) {
+            mtmd_input_chunks_free(chunks);
+            return false;
+        }
+        mtmd_input_text text;
+        text.text = formatted.c_str();
+        text.add_special = true;
+        text.parse_special = true;
+        const mtmd_bitmap * bm = bw.bitmap;
+        const int32_t rc = mtmd_tokenize(ctx, chunks, &text, &bm, 1);
+        if (rc != 0) {
+            mtmd_bitmap_free(bw.bitmap);
+            mtmd_input_chunks_free(chunks);
+            return false;
+        }
+        const int32_t erc = mtmd_helper_eval_chunks(ctx, lctx, chunks, 0, 0, n_batch, true, new_past);
+        mtmd_bitmap_free(bw.bitmap);
+        mtmd_input_chunks_free(chunks);
+        return erc == 0;
+    }
+};
+
+static std::string resolve_system_prompt(const std::string & sp) {
+    if (sp.size() > 1 && sp[0] == '@') {
+        const std::string preset = load_preset_text(sp);
+        if (preset.empty()) {
+            fprintf(stderr, "\033[33mwarning: preset '%s' not found in %s (available: ",
+                    sp.c_str(), presets_dir().c_str());
+            const auto names = list_presets();
+            for (size_t i = 0; i < names.size(); i++) {
+                fprintf(stderr, "%s%s", i > 0 ? ", " : "", names[i].c_str());
+            }
+            fprintf(stderr, ")\033[0m\n");
+            return "";
+        }
+        return preset;
+    }
+    return sp;
+}
+static bool maybe_auto_pull(std::string & model, std::string & path, std::string & friendly) {
+    if (model.rfind("hf:", 0) == 0 || model.rfind("ollama:", 0) == 0) {
+        const std::vector<std::string> pa = { model };
+        if (cmd_pull(pa) != 0) return false;
+        std::string stripped = model.substr(model.find(':') + 1);
+        if (model.rfind("ollama:", 0) == 0) {
+            const size_t colon = stripped.find(':');
+            if (colon != std::string::npos) stripped = stripped.substr(0, colon);
+            const size_t slash = stripped.find('/');
+            if (slash != std::string::npos) stripped = stripped.substr(slash + 1);
+            model = slugify(stripped + "-latest");
+        } else {
+            const std::vector<ModelEntry> models = load_models();
+            if (!models.empty()) model = models.back().name;
+        }
+        return resolve_model_arg(model, path, friendly);
+    }
+    return false;
+}
+static bool parse_messages_json(const nlohmann::json & j, std::vector<ChatMessage> & out) {
+    if (!j.contains("messages") || !j["messages"].is_array()) return false;
+    for (const auto & m : j["messages"]) {
+        if (!m.is_object() || !m.contains("role") || !m.contains("content")) continue;
+        ChatMessage cm;
+        cm.role = m["role"].get<std::string>();
+        if (m["content"].is_string()) {
+            cm.content = m["content"].get<std::string>();
+        } else if (m["content"].is_array()) {
+            for (const auto & part : m["content"]) {
+                if (part.is_object() && part.contains("type") &&
+                    part["type"].get<std::string>() == "text" && part.contains("text")) {
+                    cm.content += part["text"].get<std::string>();
+                }
+            }
+        }
+        if (cm.role == "system" || cm.role == "user" || cm.role == "assistant") {
+            out.push_back(std::move(cm));
+        }
+    }
+    return !out.empty();
+}
+
+static int cmd_serve(CliArgs & cli) {
+    for (size_t i = 0; i < cli.sub_args.size(); i++) {
+        const std::string & a = cli.sub_args[i];
+        if ((a == "--port" || a == "-p") && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], cli.port);
+        } else if (a == "--host" && i + 1 < cli.sub_args.size()) {
+            cli.host = cli.sub_args[++i];
+        } else if (a == "--model" && i + 1 < cli.sub_args.size()) {
+            cli.model = cli.sub_args[++i];
+        } else if (a == "--ctx" || a == "-c") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.n_ctx); }
+        } else if (a == "--temp" || a == "-t") {
+            if (i + 1 < cli.sub_args.size()) { float f = 0.0f; if (parse_float(cli.sub_args[++i], f)) cli.temp = f; }
+        } else if (a == "--max-tokens" || a == "-n") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.max_tokens); }
+        } else if (a == "--mmproj") {
+            if (i + 1 < cli.sub_args.size()) cli.mmproj = cli.sub_args[++i];
+        } else if (a == "--type-k") {
+            if (i + 1 < cli.sub_args.size()) cli.type_k = cli.sub_args[++i];
+        } else if (a == "--type-v") {
+            if (i + 1 < cli.sub_args.size()) cli.type_v = cli.sub_args[++i];
+        } else if (a == "--ngl" || a == "--n-gpu-layers") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.ngl); }
+        } else if (a == "--flash-attn") {
+            cli.flash_attn = true;
+        } else if (a == "--no-flash-attn") {
+            cli.flash_attn = false; cli.no_flash_attn = true;
+        } else if (a == "--threads") {
+            if (i + 1 < cli.sub_args.size()) { parse_int(cli.sub_args[++i], cli.n_threads); }
+        } else if (!a.empty() && a[0] != '-' && cli.model.empty()) {
+            cli.model = a;
+        } else {
+            fprintf(stderr, "serve: unknown option '%s'\n", a.c_str());
+            return 1;
+        }
+    }
+    if (cli.model.empty()) {
+        fprintf(stderr, "error: anvil serve requires --model <name>\n");
+        return 1;
+    }
+    std::string path, friendly;
+    if (!resolve_model_arg(cli.model, path, friendly)) {
+        fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
+                cli.model.c_str());
+        return 1;
+    }
+    if (!validate_gguf(path)) {
+        fprintf(stderr, "\033[31merror: %s\033[0m\n", gguf_check_error(path).c_str());
+        return 1;
+    }
+    cli.model = path;
+    if (friendly.empty()) friendly = slugify(std::filesystem::path(path).stem().string());
+    cli.friendly = friendly;
+
+    const HWInfo hw = probe_hw();
+    const ModelMeta meta = read_model_meta(path);
+    const int max_ctx = static_cast<int>(meta.trained_ctx);
+
+    AnvilConfig cfg = config_exists() ? load_config() : AnvilConfig{};
+    if (!cfg.model.empty() && cfg.model != path) {
+        std::vector<ModelEntry> models = load_models();
+        if (ModelEntry * e = find_model(models, cfg.model)) {
+            e->profile.apply_to(cfg);
+        }
+    }
+    if (cli.n_ctx > 0) cfg.n_ctx = cli.n_ctx;
+    if (cfg.n_ctx <= 0 && max_ctx > 0) cfg.n_ctx = max_ctx;
+    if (cli.ngl >= 0) cfg.ngl = cli.ngl;
+    else if (cfg.ngl < 0) cfg.ngl = derive_ngl(hw);
+    if (cli.temp >= 0) cfg.temp = cli.temp;
+    if (cli.n_threads > 0) cfg.n_threads = cli.n_threads;
+    if (cli.flash_attn) cfg.flash_attn = true;
+    if (cli.no_flash_attn) cfg.flash_attn = false;
+    if (!cli.type_k.empty()) cfg.type_k = kv_type_from_name(cli.type_k);
+    if (!cli.type_v.empty()) cfg.type_v = kv_type_from_name(cli.type_v);
+
+    LlamaBackend backend;
+    fprintf(stderr, "Loading model: %s ...\n", path.c_str());
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = cfg.ngl;
+    LlamaModel model(llama_model_load_from_file(path.c_str(), mparams));
+    if (!model) {
+        fprintf(stderr, "\033[31merror: failed to load model '%s'\033[0m\n", path.c_str());
+        return 1;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const char * tmpl = llama_model_chat_template(model, nullptr);
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const llama_token bos_id = llama_vocab_bos(vocab);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = static_cast<uint32_t>(cfg.n_ctx > 0 ? cfg.n_ctx : 4096);
+    cparams.n_batch = cparams.n_ctx;
+    cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
+    cparams.flash_attn_type = cfg.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.type_k = cfg.type_k;
+    cparams.type_v = cfg.type_v;
+    LlamaContext ctx(llama_init_from_model(model, cparams));
+    if (!ctx) {
+        fprintf(stderr, "\033[31merror: failed to create context\033[0m\n");
+        return 1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    LlamaSampler smpl(build_sampler_chain(vocab, cfg, false, ""));
+    if (!smpl) {
+        fprintf(stderr, "\033[31merror: failed to initialize sampler\033[0m\n");
+        return 1;
+    }
+
+    if (!sock_init()) {
+        fprintf(stderr, "\033[31merror: socket init failed\033[0m\n");
+        return 1;
+    }
+    anvil_sock_t ls = sock_listen(cli.host, cli.port);
+    if (ls == ANVIL_SOCK_INVALID) {
+        fprintf(stderr, "\033[31merror: could not listen on %s:%d\033[0m\n",
+                cli.host.c_str(), cli.port);
+        sock_shutdown();
+        return 1;
+    }
+    fprintf(stderr, "\033[1;32manvil serve\033[0m  model=%s  %s:%d\n",
+            cli.friendly.c_str(), cli.host.c_str(), cli.port);
+    fprintf(stderr, "  GET  /v1/models\n");
+    fprintf(stderr, "  POST /v1/chat/completions  (stream + non-stream)\n");
+    fprintf(stderr, "  Ctrl+C to stop\n\n");
+
+    g_serve_stop = 0;
+    install_sigint([](int) { g_serve_stop = 1; }, false);
+
+    while (!g_serve_stop) {
+        anvil_sock_t c = accept(ls, nullptr, nullptr);
+        if (c == ANVIL_SOCK_INVALID) {
+            if (g_serve_stop) break;
+            continue;
+        }
+        HttpRequest req;
+        if (!parse_http_request(c, req)) {
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        if (req.method == "OPTIONS") {
+            http_reply(c, 200, "text/plain", "", true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        if (req.path == "/v1/models" && req.method == "GET") {
+            std::vector<ModelEntry> models = load_models();
+            nlohmann::json j;
+            j["object"] = "list";
+            j["data"] = nlohmann::json::array();
+            for (const auto & e : models) {
+                nlohmann::json m;
+                m["id"] = e.name;
+                m["object"] = "model";
+                m["created"] = 0;
+                m["owned_by"] = e.source.empty() ? "anvil" : e.source;
+                j["data"].push_back(m);
+            }
+            http_reply(c, 200, "application/json", j.dump(), true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        if (req.path != "/v1/chat/completions" || req.method != "POST") {
+            http_reply(c, 404, "application/json", "{\"error\":\"not found\"}", true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        nlohmann::json jbody;
+        try {
+            jbody = nlohmann::json::parse(req.body);
+        } catch (const nlohmann::json::exception &) {
+            http_reply(c, 400, "application/json", "{\"error\":\"invalid json\"}", true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        std::vector<ChatMessage> history;
+        if (!parse_messages_json(jbody, history) || history.empty()) {
+            http_reply(c, 400, "application/json", "{\"error\":\"messages required\"}", true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        bool stream = jbody.contains("stream") && jbody["stream"].is_boolean() && jbody["stream"].get<bool>();
+        int max_tokens = cli.max_tokens;
+        if (jbody.contains("max_tokens") && jbody["max_tokens"].is_number_integer()) {
+            max_tokens = jbody["max_tokens"].get<int>();
+        }
+        std::string out_text;
+        GenStats stats;
+        if (stream) {
+            std::string hdr = "HTTP/1.1 200 OK\r\n";
+            hdr += "Content-Type: text/event-stream\r\n";
+            hdr += "Cache-Control: no-store\r\n";
+            hdr += "Access-Control-Allow-Origin: *\r\n";
+            hdr += "Connection: close\r\n\r\n";
+            sock_send(c, hdr);
+        }
+        const bool ok = stream
+            ? complete_stream(c, ctx.get(), model.get(), vocab, smpl.get(), mem, history,
+                              tmpl, add_bos, bos_id, max_tokens, out_text, stats, g_serve_stop)
+            : complete_json(ctx.get(), model.get(), vocab, smpl.get(), mem, history,
+                            tmpl, add_bos, bos_id, max_tokens, out_text, stats, g_serve_stop);
+        if (!ok && !stream) {
+            http_reply(c, 500, "application/json", "{\"error\":\"generation failed\"}", true);
+            ANVIL_SOCK_CLOSE(c);
+            continue;
+        }
+        if (!stream) {
+            nlohmann::json resp;
+            resp["id"] = "chatcmpl-anvil";
+            resp["object"] = "chat.completion";
+            resp["created"] = now_unix();
+            resp["model"] = "anvil";
+            resp["choices"] = nlohmann::json::array();
+            nlohmann::json ch;
+            ch["index"] = 0;
+            ch["message"] = {{"role", "assistant"}, {"content", out_text}};
+            ch["finish_reason"] = stats.tokens_generated >= max_tokens && max_tokens > 0 ? "length" : "stop";
+            resp["choices"].push_back(ch);
+            resp["usage"] = {
+                {"prompt_tokens", 0},
+                {"completion_tokens", stats.tokens_generated},
+                {"total_tokens", stats.tokens_generated},
+            };
+            http_reply(c, 200, "application/json", resp.dump(), true);
+        }
+        ANVIL_SOCK_CLOSE(c);
+    }
+    ANVIL_SOCK_CLOSE(ls);
+    sock_shutdown();
+    printf("\nserver stopped\n");
+    return 0;
+}
+
 static std::string session_path() {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -2841,6 +4136,31 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     const bool has_encoder = llama_model_has_encoder(model);
     const bool has_decoder = llama_model_has_decoder(model);
 
+    VisionSession vision;
+    if (!cli.mmproj.empty()) {
+        fprintf(stderr, "Loading vision projector: %s ...\n", cli.mmproj.c_str());
+        if (!vision.init(cli.mmproj, model, hw, cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads)) {
+            fprintf(stderr, "\033[31merror: failed to load vision projector '%s'\033[0m\n",
+                    cli.mmproj.c_str());
+            return 1;
+        }
+        fprintf(stderr, "  vision     : \033[32mready\033[0m\n");
+    }
+
+    RagIndex rag;
+    if (!cli.rag_dir.empty()) {
+        fprintf(stderr, "Indexing RAG corpus: %s ...\n", cli.rag_dir.c_str());
+        if (!rag.build_dir(cli.rag_dir)) {
+            fprintf(stderr, "\033[33mwarning: no indexable text files in %s; RAG disabled\033[0m\n",
+                    cli.rag_dir.c_str());
+        } else {
+            fprintf(stderr, "  rag        : \033[32m%d chunk(s) indexed\033[0m\n",
+                    static_cast<int>(rag.size()));
+        }
+    }
+
+    std::vector<std::string> shell_history = load_history_lines();
+
     fprintf(stderr, "\n\033[1;36mModel Info:\033[0m\n");
     fprintf(stderr, "  trained ctx : %d tokens\n", n_ctx_train);
     fprintf(stderr, "  requested   : %d tokens\n", cfg.n_ctx);
@@ -2920,15 +4240,16 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     std::vector<ChatMessage> history;
     std::vector<llama_token> prev_tokens;
     Utf8Buffer utf8_buf;
+    std::string pending_image;
     int total_tokens_generated = 0;
     double total_gen_time = 0.0;
     const char * tmpl = llama_model_chat_template(model, nullptr);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const llama_token bos_id = llama_vocab_bos(vocab);
-    const std::string sys_prompt = !cli.system_prompt.empty() ? cli.system_prompt : cfg.system_prompt;
+    std::string sys_prompt = !cli.system_prompt.empty() ? cli.system_prompt : cfg.system_prompt;
 
     if (!sys_prompt.empty()) {
-        history.push_back({"system", sys_prompt});
+        history.push_back({"system", sys_prompt, ""});
     }
 
     auto render_conversation = [&](bool add_ass, std::string & out) -> bool {
@@ -2971,10 +4292,20 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     };
 
     MarkdownStream md;
+    bool stderr_tty = false;
+#ifdef _WIN32
+    stderr_tty = _isatty(_fileno(stderr)) != 0;
+#else
+    stderr_tty = isatty(STDERR_FILENO) != 0;
+#endif
+    static const char HUD_SPIN[] = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
     auto generate = [&](std::string & response, GenStats & stats) -> bool {
         llama_sampler_reset(smpl.get());
         const auto gen_start = std::chrono::steady_clock::now();
         bool decode_ok = true;
+        bool stopped = false;
+        auto hud_next = std::chrono::steady_clock::now();
+        int spin = 0;
         while (true) {
             const int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
             if (n_ctx_used >= static_cast<int32_t>(llama_n_ctx(ctx))) {
@@ -2986,7 +4317,22 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 fprintf(stderr, "\n\033[33m⚠ max tokens reached (%d)\033[0m\n", cli.max_tokens);
                 break;
             }
-            if (g_interrupted.load()) break;
+            if (g_interrupted) {
+                stopped = true;
+                break;
+            }
+            if (stderr_tty) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= hud_next) {
+                    const double el = std::chrono::duration<double>(now - gen_start).count();
+                    const double tps = el > 0.0 ? stats.tokens_generated / el : 0.0;
+                    fprintf(stderr, "\r\033[2K  %c %d tok | %.1f t/s",
+                            HUD_SPIN[spin % 10], stats.tokens_generated, tps);
+                    fflush(stderr);
+                    spin++;
+                    hud_next = now + std::chrono::milliseconds(150);
+                }
+            }
 
             const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
             if (llama_vocab_is_eog(vocab, id)) break;
@@ -3009,6 +4355,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 break;
             }
         }
+        if (stderr_tty) fprintf(stderr, "\r\033[2K");
         const std::string tail = utf8_buf.flush();
         if (!tail.empty()) {
             md.feed(tail);
@@ -3017,6 +4364,10 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         md.flush();
         stats.elapsed_sec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - gen_start).count();
+        if (stopped) {
+            fprintf(stderr, "\033[33m[stopped by Ctrl+C — session preserved]\033[0m\n");
+            g_interrupted = 0;
+        }
         return decode_ok;
     };
 
@@ -3052,7 +4403,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
     auto finish_turn = [&](const std::string & resp) {
         if (!resp.empty()) {
-            history.push_back({"assistant", resp});
+            history.push_back({"assistant", resp, ""});
         }
     };
 
@@ -3112,10 +4463,44 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         }
     };
 
+    std::string session_path_str;
+    if (cli.resume) {
+        session_path_str = latest_session_for(cli.friendly.empty() ? slugify(std::filesystem::path(cli.model).stem().string()) : cli.friendly);
+        if (!session_path_str.empty()) {
+            std::vector<ChatMessage> loaded;
+            if (load_session(session_path_str, loaded)) {
+                history = std::move(loaded);
+                fprintf(stderr, "\033[1;36mResumed session: %s (%zu message(s))\033[0m\n",
+                        session_path_str.c_str(), history.size());
+                llama_memory_clear(mem, true);
+                prev_tokens.clear();
+                if (!history.empty()) {
+                    std::string formatted;
+                    if (render_conversation(false, formatted) && !formatted.empty()) {
+                        std::vector<llama_token> all = tokenize_render(vocab, formatted);
+                        if (!all.empty()) {
+                            std::vector<llama_token> full;
+                            full.reserve(all.size() + 1);
+                            if (add_bos && (all.empty() || all[0] != bos_id)) full.push_back(bos_id);
+                            full.insert(full.end(), all.begin(), all.end());
+                            if (decode_tokens(full)) prev_tokens = std::move(all);
+                        }
+                    }
+                }
+            } else {
+                session_path_str.clear();
+            }
+        }
+    }
+    if (session_path_str.empty()) {
+        session_path_str = new_session_path(
+            cli.friendly.empty() ? slugify(std::filesystem::path(cli.model).stem().string()) : cli.friendly);
+    }
+
     if (cli.prompt.empty()) {
 
         while (true) {
-            g_interrupted.store(false);
+            g_interrupted = 0;
             const int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
             if (n_ctx_used > 0) print_ctx_bar(n_ctx_used, static_cast<int>(llama_n_ctx(ctx)));
             printf("\033[32m> \033[0m");
@@ -3125,7 +4510,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             if (!std::getline(std::cin, user_input)) break;
             while (!user_input.empty() && (user_input.back() == '\n' || user_input.back() == '\r'))
                 user_input.pop_back();
-            if (g_interrupted.load()) break;
+            if (g_interrupted) break;
             if (user_input.empty()) continue;
 
             if (user_input == "/exit" || user_input == "/quit") break;
@@ -3135,11 +4520,170 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 llama_memory_clear(mem, true);
                 prev_tokens.clear();
                 if (!sys_prompt.empty()) {
-                    history.push_back({"system", sys_prompt});
+                    history.push_back({"system", sys_prompt, ""});
                 }
                 total_tokens_generated = 0;
                 total_gen_time = 0.0;
+                save_session(session_path_str, history);
                 printf("Chat cleared.\n\n");
+                continue;
+            }
+
+            if (user_input == "/new") {
+                history.clear();
+                llama_memory_clear(mem, true);
+                prev_tokens.clear();
+                total_tokens_generated = 0;
+                total_gen_time = 0.0;
+                if (!sys_prompt.empty()) {
+                    history.push_back({"system", sys_prompt, ""});
+                }
+                session_path_str = new_session_path(
+                    cli.friendly.empty() ? slugify(std::filesystem::path(cli.model).stem().string()) : cli.friendly);
+                printf("New session started.\n\n");
+                continue;
+            }
+
+            if (user_input == "/regenerate" || user_input.rfind("/regenerate ", 0) == 0) {
+                if (history.size() >= 2 &&
+                    history.back().role == "assistant" &&
+                    history[history.size() - 2].role == "user") {
+                    history.pop_back();
+                    llama_memory_clear(mem, true);
+                    prev_tokens.clear();
+                    std::string formatted;
+                    if (render_conversation(true, formatted) && start_turn(formatted)) {
+                        std::string resp;
+                        GenStats stats;
+                        generate(resp, stats);
+                        printf("\n");
+                        if (stats.tokens_generated > 0) {
+                            fprintf(stderr, "  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
+                                    stats.tokens_generated, stats.tps(), stats.elapsed_sec);
+                        }
+                        total_tokens_generated += stats.tokens_generated;
+                        total_gen_time += stats.elapsed_sec;
+                        finish_turn(resp);
+                        save_session(session_path_str, history);
+                        printf("\n");
+                    }
+                } else {
+                    printf("Nothing to regenerate.\n\n");
+                }
+                continue;
+            }
+
+            if (user_input.rfind("/edit ", 0) == 0) {
+                if (history.size() >= 2 &&
+                    history.back().role == "assistant" &&
+                    history[history.size() - 2].role == "user") {
+                    const std::string new_text = user_input.substr(6);
+                    history[history.size() - 2].content = new_text;
+                    history.pop_back();
+                    llama_memory_clear(mem, true);
+                    prev_tokens.clear();
+                    std::string formatted;
+                    if (render_conversation(true, formatted) && start_turn(formatted)) {
+                        std::string resp;
+                        GenStats stats;
+                        generate(resp, stats);
+                        printf("\n");
+                        if (stats.tokens_generated > 0) {
+                            fprintf(stderr, "  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
+                                    stats.tokens_generated, stats.tps(), stats.elapsed_sec);
+                        }
+                        total_tokens_generated += stats.tokens_generated;
+                        total_gen_time += stats.elapsed_sec;
+                        finish_turn(resp);
+                        save_session(session_path_str, history);
+                        printf("\n");
+                    }
+                } else {
+                    printf("Nothing to edit.\n\n");
+                }
+                continue;
+            }
+
+            if (user_input.rfind("/image ", 0) == 0) {
+                if (vision.ctx == nullptr) {
+                    printf("Vision not loaded. Run with --mmproj <file>.\n\n");
+                    continue;
+                }
+                std::string img = expand_home(user_input.substr(7));
+                if (!std::filesystem::exists(img)) {
+                    printf("No such image: %s\n\n", img.c_str());
+                    continue;
+                }
+                pending_image = img;
+                printf("Image attached: %s — send a message to use it (or /image again to replace).\n\n",
+                       img.c_str());
+                continue;
+            }
+
+            if (user_input == "/image") {
+                printf("Usage: /image <path>\n\n");
+                continue;
+            }
+
+            if (user_input.rfind("/system ", 0) == 0 || user_input == "/system") {
+                if (user_input == "/system") {
+                    const auto names = list_presets();
+                    if (names.empty()) {
+                        printf("No presets in %s.\n", presets_dir().c_str());
+                    } else {
+                        printf("Presets in %s:\n", presets_dir().c_str());
+                        for (const auto & n : names) printf("  @%s\n", n.c_str());
+                        printf("Use: /system @<name> or /system <text>\n");
+                    }
+                    printf("\n");
+                    continue;
+                }
+                const std::string arg = user_input.substr(8);
+                const std::string sp = resolve_system_prompt(arg);
+                if (!sp.empty() || (arg.size() > 1 && arg[0] == '@')) {
+                    if (!sp.empty()) {
+                        history.erase(std::remove_if(history.begin(), history.end(),
+                            [](const ChatMessage & m) { return m.role == "system"; }),
+                            history.end());
+                        history.insert(history.begin(), ChatMessage{"system", sp, ""});
+                        sys_prompt = sp;
+                        llama_memory_clear(mem, true);
+                        prev_tokens.clear();
+                        printf("System prompt set. Next message re-decodes the conversation.\n\n");
+                        continue;
+                    }
+                    printf("Preset not found.\n\n");
+                    continue;
+                }
+                printf("System prompt set to raw text.\n\n");
+                continue;
+            }
+
+            if (user_input == "/history") {
+                if (shell_history.empty()) {
+                    printf("No shell history yet.\n\n");
+                } else {
+                    printf("\n\033[1;36m── Shell History (%zu) ──\033[0m\n", shell_history.size());
+                    for (size_t i = 0; i < shell_history.size(); i++) {
+                        printf("  %4zu  %s\n", i + 1, shell_history[i].c_str());
+                    }
+                    printf("\n");
+                }
+                continue;
+            }
+
+            if (user_input.rfind("/search ", 0) == 0) {
+                const std::string term = user_input.substr(8);
+                printf("\n\033[1;36m── History matching '%s' ──\033[0m\n", term.c_str());
+                int hits = 0;
+                for (size_t i = 0; i < shell_history.size(); i++) {
+                    if (shell_history[i].find(term) != std::string::npos) {
+                        printf("  %4zu  %s\n", i + 1, shell_history[i].c_str());
+                        hits++;
+                    }
+                }
+                if (hits == 0) printf("  (no matches)\n");
+                printf("\n");
                 continue;
             }
 
@@ -3252,7 +4796,62 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 continue;
             }
 
-            history.push_back({"user", user_input});
+            std::string user_msg = user_input;
+            std::string rag_ctx;
+            if (!cli.rag_dir.empty() && !rag.empty()) {
+                rag_ctx = rag.context_for(user_input, 3);
+                if (!rag_ctx.empty()) {
+                    user_msg = "Relevant context:\n\n" + rag_ctx + "Question: " + user_input;
+                }
+            }
+            if (!pending_image.empty() && vision.ctx != nullptr) {
+                history.push_back({"user", user_msg, pending_image});
+                pending_image.clear();
+                std::string formatted;
+                if (!render_conversation(true, formatted)) {
+                    history.pop_back();
+                    llama_memory_clear(mem, true);
+                    prev_tokens.clear();
+                    std::string raw = user_msg + "\n";
+                    std::vector<llama_token> raw_toks;
+                    raw_toks.reserve(raw.size() + 1);
+                    if (add_bos) raw_toks.push_back(bos_id);
+                    const auto extra = tokenize_render(vocab, raw);
+                    raw_toks.insert(raw_toks.end(), extra.begin(), extra.end());
+                    if (!decode_tokens(raw_toks)) continue;
+                    prev_tokens = extra;
+                    std::string resp;
+                    GenStats stats;
+                    generate(resp, stats);
+                    printf("\n");
+                    finish_turn(resp);
+                    save_session(session_path_str, history);
+                    continue;
+                }
+                llama_memory_clear(mem, true);
+                prev_tokens.clear();
+                llama_pos new_past = 0;
+                if (!vision.eval_image_turn(ctx.get(), formatted, history.back().image_path,
+                                            &new_past, static_cast<int32_t>(llama_n_batch(ctx)))) {
+                    fprintf(stderr, "\033[31merror: vision encode failed\033[0m\n");
+                    history.pop_back();
+                    continue;
+                }
+                std::string resp;
+                GenStats stats;
+                generate(resp, stats);
+                printf("\n");
+                if (stats.tokens_generated > 0) {
+                    fprintf(stderr, "  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
+                            stats.tokens_generated, stats.tps(), stats.elapsed_sec);
+                }
+                total_tokens_generated += stats.tokens_generated;
+                total_gen_time += stats.elapsed_sec;
+                finish_turn(resp);
+                save_session(session_path_str, history);
+                continue;
+            }
+            history.push_back({"user", user_msg, ""});
             std::string formatted;
             if (!render_conversation(true, formatted)) {
 
@@ -3272,6 +4871,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 generate(resp, stats);
                 printf("\n");
                 finish_turn(resp);
+                save_session(session_path_str, history);
+                append_history_line(user_input);
                 continue;
             }
             if (!start_turn(formatted)) continue;
@@ -3287,11 +4888,48 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             total_tokens_generated += stats.tokens_generated;
             total_gen_time += stats.elapsed_sec;
             finish_turn(resp);
+            save_session(session_path_str, history);
+            append_history_line(user_input);
         }
     } else {
 
-        history.push_back({"user", cli.prompt});
+        std::string shot_prompt = cli.prompt;
+        RagIndex shot_rag;
+        if (!cli.rag_dir.empty() && shot_rag.build_dir(cli.rag_dir)) {
+            const std::string ctx = shot_rag.context_for(cli.prompt, 3);
+            if (!ctx.empty()) shot_prompt = "Relevant context:\n\n" + ctx + "Question: " + cli.prompt;
+        }
+        history.push_back({"user", shot_prompt, cli.image});
         std::string formatted;
+        if (!cli.image.empty() && vision.ctx != nullptr) {
+            if (!std::filesystem::exists(cli.image)) {
+                fprintf(stderr, "\033[31merror: no such image: %s\033[0m\n", cli.image.c_str());
+                return 1;
+            }
+            llama_memory_clear(mem, true);
+            llama_pos new_past = 0;
+            if (!render_conversation(true, formatted)) {
+                fprintf(stderr, "\033[31merror: template rendering failed\033[0m\n");
+                return 1;
+            }
+            if (!vision.eval_image_turn(ctx.get(), formatted, cli.image,
+                                        &new_past, static_cast<int32_t>(llama_n_batch(ctx)))) {
+                fprintf(stderr, "\033[31merror: vision encode failed\033[0m\n");
+                return 1;
+            }
+            std::string resp;
+            GenStats stats;
+            generate(resp, stats);
+            printf("\n");
+            if (stats.tokens_generated > 0) {
+                fprintf(stderr, "\n  \033[2m[%d tokens, %.1f t/s, %.1fs]\033[0m\n",
+                        stats.tokens_generated, stats.tps(), stats.elapsed_sec);
+            }
+            finish_turn(resp);
+            save_session(session_path_str, history);
+            printf("\nExiting.\n");
+            return 0;
+        }
         bool have_render = render_conversation(true, formatted);
         std::string prompt_text = have_render ? formatted : (cli.prompt + "\n");
         if (have_render && formatted.empty()) prompt_text = cli.prompt + "\n";
@@ -3317,6 +4955,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                     stats.tokens_generated, stats.tps(), stats.elapsed_sec);
         }
         finish_turn(resp);
+        save_session(session_path_str, history);
+        append_history_line(cli.prompt);
     }
     printf("\nExiting.\n");
     return 0;
@@ -3324,7 +4964,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
-    signal(SIGINT, anvil_signal_handler);
+    install_sigint(anvil_signal_handler);
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
         if (level >= GGML_LOG_LEVEL_WARN) fprintf(stderr, "%s", text);
     }, nullptr);
@@ -3338,6 +4978,10 @@ int main(int argc, char ** argv) {
     if (cli.sub == "profile") return cmd_profile(cli.sub_args);
     if (cli.sub == "rm")      return cmd_rm(cli.sub_args);
     if (cli.sub == "pull")    return cmd_pull(cli.sub_args);
+    if (cli.sub == "serve")   return cmd_serve(cli);
+    if (cli.sub == "bench")   return cmd_bench(cli);
+    if (cli.sub == "doctor")  return cmd_doctor(cli.sub_args);
+    if (cli.sub == "self-update") return cmd_self_update(cli.sub_args);
 
     if (cli.model.empty() && !cli.setup) {
         fprintf(stderr, "error: no model specified\n\n");
@@ -3345,15 +4989,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (!cli.token.empty()) g_hf_token = cli.token;
+    const char * hf_env = std::getenv("HF_TOKEN");
+    if (g_hf_token.empty() && hf_env && hf_env[0]) g_hf_token = hf_env;
+
     std::string resolved_path;
     std::string friendly;
     if (!cli.model.empty()) {
         if (!resolve_model_arg(cli.model, resolved_path, friendly)) {
-            fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
-                    cli.model.c_str());
-            fprintf(stderr, "  Try: anvil pull ollama:%s | anvil pull hf:<repo> | anvil models import <file.gguf> --name %s\n",
-                    cli.model.c_str(), cli.model.c_str());
-            return 1;
+            if (!maybe_auto_pull(cli.model, resolved_path, friendly)) {
+                fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
+                        cli.model.c_str());
+                fprintf(stderr, "  Try: anvil pull ollama:%s | anvil pull hf:<repo> | anvil models import <file.gguf> --name %s\n",
+                        cli.model.c_str(), cli.model.c_str());
+                return 1;
+            }
         }
         cli.model = resolved_path;
         if (friendly.empty()) {
@@ -3457,6 +5107,12 @@ int main(int argc, char ** argv) {
     if (cli.mtp)                cfg.mtp = true;
     if (!cli.type_k.empty())    cfg.type_k = kv_type_from_name(cli.type_k);
     if (!cli.type_v.empty())    cfg.type_v = kv_type_from_name(cli.type_v);
+
+    if (cli.system_prompt.size() > 1 && cli.system_prompt[0] == '@' && !load_preset_text(cli.system_prompt).empty()) {
+        cfg.system_prompt = load_preset_text(cli.system_prompt);
+    } else if (!cli.system_prompt.empty()) {
+        cfg.system_prompt = cli.system_prompt;
+    }
 
     if (cli.save_profile && entry) {
         ModelProfile & p = entry->profile;

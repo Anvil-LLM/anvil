@@ -167,11 +167,9 @@ Currently implemented:
 
 Not yet implemented (roadmap):
 
-- `anvil serve` / OpenAI-compatible API
 - Monitoring dashboard
 - Cloud proxy
 - Finetuning
-- Self-updater
 
 ---
 
@@ -186,9 +184,9 @@ Not yet implemented (roadmap):
 | Speculative decoding (MTP/NextN) | 🛠️ |
 | Chat REPL (`anvil run`) | ✅ |
 | Monitoring dashboard | 🛠️ |
-| OpenAI API server (`anvil serve`) | 🛠️ |
+| OpenAI API server (`anvil serve`) | ✅ |
 | Hardware auto-probe | 🛠️ |
-| Self-updater (`anvil self-update`) | 🛠️ |
+| Self-updater (`anvil self-update`) | ✅ |
 | Cloud proxy | 🛠️ |
 | Finetuning | 🛠️ |
 
