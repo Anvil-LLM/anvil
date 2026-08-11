@@ -749,7 +749,7 @@ CliArgs parse_args(int argc, char ** argv) {
     const std::string first = argv[1];
     if (first == "models" || first == "profile" || first == "rm" || first == "pull" ||
         first == "serve" || first == "doctor" || first == "self-update" || first == "bench" ||
-        first == "mcp" || first == "eval") {
+        first == "mcp" || first == "keys" || first == "eval") {
         a.sub = first;
         for (int i = 2; i < argc; i++) a.sub_args.emplace_back(argv[i]);
         return a;
@@ -4479,6 +4479,276 @@ static std::string chat_tool_calls_to_json(const std::vector<common_chat_tool_ca
     return arr.dump();
 }
 
+inline std::string keys_path() { return config_dir() + "/keys.json"; }
+
+struct RemoteKeys {
+    std::string openai;
+    std::string anthropic;
+};
+
+static RemoteKeys load_remote_keys() {
+    RemoteKeys k;
+    const char * o = std::getenv("OPENAI_API_KEY");
+    const char * a = std::getenv("ANTHROPIC_API_KEY");
+    if (o && o[0]) k.openai = o;
+    if (a && a[0]) k.anthropic = a;
+    std::ifstream f(keys_path());
+    if (!f) return k;
+    nlohmann::json j;
+    try {
+        f >> j;
+        if (j.contains("openai") && j["openai"].is_string()) k.openai = j["openai"].get<std::string>();
+        if (j.contains("anthropic") && j["anthropic"].is_string()) k.anthropic = j["anthropic"].get<std::string>();
+    } catch (const nlohmann::json::exception &) {}
+    return k;
+}
+
+static bool save_remote_keys(const RemoteKeys & k) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(config_dir(), ec);
+    nlohmann::json j;
+    if (!k.openai.empty()) j["openai"] = k.openai;
+    if (!k.anthropic.empty()) j["anthropic"] = k.anthropic;
+    const std::string tmp = keys_path() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return false;
+        f << j.dump(2) << "\n";
+        f.flush();
+        if (!f) return false;
+    }
+    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, ec);
+    ec.clear();
+    fs::rename(tmp, keys_path(), ec);
+    return !ec;
+}
+
+static bool remote_chat(const std::string & provider, const std::string & model,
+                        const nlohmann::ordered_json & messages,
+                        const std::string & system_prompt, int max_tokens,
+                        std::string & out_text,
+                        const std::function<void(const std::string &)> & on_delta = {}) {
+    const RemoteKeys keys = load_remote_keys();
+    const std::string & key = provider == "anthropic" ? keys.anthropic : keys.openai;
+    if (key.empty()) {
+        out_text = "error: no " + provider + " API key. Set " +
+                   (provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY") +
+                   " or run: anvil keys set " + provider + " <key>";
+        return false;
+    }
+    nlohmann::ordered_json body;
+    body["model"] = model;
+    if (!system_prompt.empty()) {
+        nlohmann::ordered_json msgs = nlohmann::ordered_json::array();
+        msgs.push_back({{{"role", "system"}, {"content", system_prompt}}});
+        for (const auto & m : messages) msgs.push_back(m);
+        body["messages"] = std::move(msgs);
+    } else {
+        body["messages"] = messages;
+    }
+    body["stream"] = true;
+    body["max_tokens"] = max_tokens > 0 ? max_tokens : 2048;
+
+    std::string url, path;
+    httplib::Headers hdrs;
+    const char * base_env = provider == "anthropic"
+        ? std::getenv("ANVIL_ANTHROPIC_BASE_URL") : std::getenv("ANVIL_OPENAI_BASE_URL");
+    if (provider == "anthropic") {
+        url = base_env && base_env[0] ? base_env : "https://api.anthropic.com";
+        path = "/v1/messages";
+        hdrs = {{"x-api-key", key}, {"anthropic-version", "2023-06-01"},
+               {"Content-Type", "application/json"}};
+    } else {
+        url = base_env && base_env[0] ? base_env : "https://api.openai.com";
+        path = "/v1/chat/completions";
+        hdrs = {{"Authorization", "Bearer " + key}, {"Content-Type", "application/json"}};
+    }
+
+    httplib::Client cli(url);
+    cli.set_connection_timeout(30, 0);
+    cli.set_read_timeout(300, 0);
+    cli.set_follow_location(true);
+
+    std::string sse_buf;
+    std::string raw_body;
+    auto on_chunk = [&](const char * data, size_t len) -> bool {
+        raw_body.append(data, len);
+        sse_buf.append(data, len);
+        size_t pos = 0;
+        while (true) {
+            const size_t nl = sse_buf.find('\n', pos);
+            if (nl == std::string::npos) break;
+            const std::string line = sse_buf.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (line.rfind("data:", 0) != 0) continue;
+            const std::string payload = line.size() > 5 ? line.substr(5) : "";
+            if (payload == "[DONE]") continue;
+            try {
+                const nlohmann::json ev = nlohmann::json::parse(payload);
+                if (provider == "anthropic") {
+                    if (ev.value("type", std::string()) == "content_block_delta") {
+                        const auto & delta = ev["delta"];
+                        if (delta.value("type", std::string()) == "text_delta") {
+                            const std::string txt = delta.value("text", std::string());
+                            out_text += txt;
+                            if (on_delta) on_delta(txt);
+                        }
+                    }
+                } else if (ev.contains("choices") && ev["choices"].is_array() &&
+                           !ev["choices"].empty()) {
+                    const auto & ch = ev["choices"][0];
+                    if (ch.contains("delta")) {
+                        const std::string txt = ch["delta"].value("content", std::string());
+                        if (!txt.empty()) {
+                            out_text += txt;
+                            if (on_delta) on_delta(txt);
+                        }
+                    }
+                }
+            } catch (const nlohmann::json::exception &) {}
+        }
+        sse_buf.erase(0, pos);
+        return true;
+    };
+    const std::string body_str = body.dump();
+    auto res = cli.Post(path, hdrs,
+        [&](size_t offset, httplib::DataSink & sink) -> bool {
+            if (offset < body_str.size()) {
+                sink.write(body_str.data() + offset, body_str.size() - offset);
+            } else {
+                sink.done();
+            }
+            return true;
+        },
+        "application/json", on_chunk);
+    if (!res) {
+        out_text = "error: request to " + url + path + " failed: " + httplib::to_string(res.error());
+        return false;
+    }
+    if (res->status != 200) {
+        std::string detail = raw_body.empty() ? res->body : raw_body;
+        if (detail.size() > 400) detail.resize(400);
+        out_text = "error: HTTP " + std::to_string(res->status) + " from " + provider + ": " + detail;
+        return false;
+    }
+    if (out_text.empty()) {
+        out_text = "(empty response)";
+        return false;
+    }
+    return true;
+}
+
+static int cmd_keys(const std::vector<std::string> & args) {
+    if (args.empty() || args[0] == "list") {
+        const RemoteKeys k = load_remote_keys();
+        auto mask = [](const std::string & s) {
+            if (s.size() < 8) return std::string();
+            return s.substr(0, 4) + "\xe2\x80\xa6" + s.substr(s.size() - 4);
+        };
+        printf("\n\033[1;36m── API Keys ──\033[0m\n");
+        printf("  openai    : %s\n", k.openai.empty() ? "(not set)" : mask(k.openai).c_str());
+        printf("  anthropic : %s\n", k.anthropic.empty() ? "(not set)" : mask(k.anthropic).c_str());
+        printf("\nusage: anvil keys set <openai|anthropic> <key>\n");
+        printf("       anvil keys unset <openai|anthropic>\n\n");
+        return 0;
+    }
+    if (args[0] == "set" && args.size() >= 3) {
+        if (args[1] != "openai" && args[1] != "anthropic") {
+            fprintf(stderr, "error: provider must be 'openai' or 'anthropic'\n");
+            return 1;
+        }
+        RemoteKeys k = load_remote_keys();
+        if (args[1] == "openai") k.openai = args[2];
+        else k.anthropic = args[2];
+        if (!save_remote_keys(k)) {
+            fprintf(stderr, "\033[31merror: could not save %s\033[0m\n", keys_path().c_str());
+            return 1;
+        }
+        printf("Saved %s key to %s\n", args[1].c_str(), keys_path().c_str());
+        return 0;
+    }
+    if (args[0] == "unset" && args.size() >= 2) {
+        if (args[1] != "openai" && args[1] != "anthropic") {
+            fprintf(stderr, "error: provider must be 'openai' or 'anthropic'\n");
+            return 1;
+        }
+        RemoteKeys k = load_remote_keys();
+        if (args[1] == "openai") k.openai.clear();
+        else k.anthropic.clear();
+        save_remote_keys(k);
+        printf("Removed %s key\n", args[1].c_str());
+        return 0;
+    }
+    fprintf(stderr, "keys: unknown subcommand '%s'\n", args[0].c_str());
+    return 1;
+}
+
+static int cmd_remote(CliArgs & cli) {
+    const size_t colon = cli.model.find(':');
+    const std::string provider = cli.model.substr(0, colon);
+    const std::string model = cli.model.substr(colon + 1);
+    const std::string api_name = provider == "claude" ? "anthropic" : "openai";
+    const char * env_model = std::getenv(provider == "claude" ? "ANVIL_ANTHROPIC_MODEL" : "ANVIL_OPENAI_MODEL");
+    const std::string model_name = model.empty()
+        ? (env_model && env_model[0] ? env_model : (api_name == "anthropic" ? "claude-sonnet-4-5" : "gpt-4o-mini"))
+        : model;
+
+    auto call = [&](const nlohmann::ordered_json & msgs, std::string & out,
+                    const std::function<void(const std::string &)> & on_delta = {}) -> bool {
+        return remote_chat(api_name, model_name, msgs, cli.system_prompt, cli.max_tokens, out, on_delta);
+    };
+
+    if (!cli.prompt.empty()) {
+        nlohmann::ordered_json msgs = nlohmann::ordered_json::array();
+        nlohmann::ordered_json m;
+        m["role"] = "user";
+        m["content"] = cli.prompt;
+        msgs.push_back(std::move(m));
+        std::string out;
+        if (!call(msgs, out, [](const std::string & d) { fputs(d.c_str(), stdout); fflush(stdout); })) {
+            fprintf(stderr, "\033[31m%s\033[0m\n", out.c_str());
+            return 1;
+        }
+        printf("\n");
+        return 0;
+    }
+
+    nlohmann::ordered_json msgs = nlohmann::ordered_json::array();
+    if (!cli.system_prompt.empty()) {
+        nlohmann::ordered_json m;
+        m["role"] = "system";
+        m["content"] = cli.system_prompt;
+        msgs.push_back(std::move(m));
+    }
+    printf("\033[1;36manvil %s session (model: %s) — Ctrl+C to exit\033[0m\n\n", api_name.c_str(), model_name.c_str());
+    while (true) {
+        printf("\033[32m> \033[0m");
+        fflush(stdout);
+        std::string line;
+        if (!std::getline(std::cin, line)) break;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line.empty()) continue;
+        if (line == "/exit" || line == "/quit") break;
+        nlohmann::ordered_json m;
+        m["role"] = "user";
+        m["content"] = line;
+        msgs.push_back(std::move(m));
+        std::string out;
+        if (!call(msgs, out, [](const std::string & d) { fputs(d.c_str(), stdout); fflush(stdout); })) {
+            fprintf(stderr, "\033[31m%s\033[0m\n", out.c_str());
+            if (msgs.is_array() && !msgs.empty()) msgs.erase(msgs.end() - 1);
+            continue;
+        }
+        printf("\n\n");
+        nlohmann::ordered_json a;
+        a["role"] = "assistant";
+        a["content"] = out;
+        msgs.push_back(std::move(a));
+    }
+    return 0;
+}
+
 static int cmd_mcp(const std::vector<std::string> & args) {
     if (args.empty()) {
         fprintf(stderr, "usage: anvil mcp add <name> <command|url> [args...]\n");
@@ -6025,6 +6295,31 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 continue;
             }
 
+            if (user_input.rfind("gpt: ", 0) == 0 || user_input.rfind("claude: ", 0) == 0) {
+                const size_t sp = user_input.find(' ');
+                const std::string provider = user_input.substr(0, sp);
+                const std::string text = user_input.substr(sp + 1);
+                const std::string api_name = provider == "claude" ? "anthropic" : "openai";
+                const char * env_model = std::getenv(provider == "claude" ? "ANVIL_ANTHROPIC_MODEL" : "ANVIL_OPENAI_MODEL");
+                const std::string model_name = env_model && env_model[0]
+                    ? env_model : (api_name == "anthropic" ? "claude-sonnet-4-5" : "gpt-4o-mini");
+                history.push_back({"user", text, ""});
+                std::string resp;
+                if (remote_chat(api_name, model_name, chat_history_to_oai(history), sys_prompt,
+                                cli.max_tokens, resp,
+                                [&](const std::string & d) { md.feed(d); })) {
+                    md.flush();
+                    finish_turn(resp);
+                } else {
+                    md.flush();
+                    fprintf(stderr, "\033[31m%s\033[0m\n", resp.c_str());
+                    history.pop_back();
+                }
+                save_session(session_path_str, history);
+                append_history_line(user_input);
+                continue;
+            }
+
             std::string user_msg = user_input;
             std::string rag_ctx;
             if (!session_rag.empty()) {
@@ -6227,7 +6522,12 @@ int main(int argc, char ** argv) {
     if (cli.sub == "doctor")  return cmd_doctor(cli.sub_args);
     if (cli.sub == "self-update") return cmd_self_update(cli.sub_args);
     if (cli.sub == "mcp")     return cmd_mcp(cli.sub_args);
+    if (cli.sub == "keys")    return cmd_keys(cli.sub_args);
     if (cli.sub == "eval")    return cmd_eval(cli);
+
+    if (cli.model.rfind("gpt:", 0) == 0 || cli.model.rfind("claude:", 0) == 0) {
+        return cmd_remote(cli);
+    }
 
     if (cli.model.empty() && !cli.setup) {
         fprintf(stderr, "error: no model specified\n\n");
