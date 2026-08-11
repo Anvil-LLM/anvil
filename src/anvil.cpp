@@ -3463,7 +3463,7 @@ static std::string asset_name_for_platform(const std::string & os, const std::st
 
 static int cmd_self_update(const std::vector<std::string> & args) {
     (void)args;
-    const std::string url = "https://api.github.com/repos/gondaliyashreyan1/Anvil/releases/latest";
+    const std::string url = "https://api.github.com/repos/Anvil-LLM/anvil/releases/latest";
     const std::string body = http_get(url);
     if (body.empty()) {
         fprintf(stderr, "\033[31merror: could not reach GitHub releases API\033[0m\n");
