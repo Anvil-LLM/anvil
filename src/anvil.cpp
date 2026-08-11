@@ -64,6 +64,7 @@
 #include <nlohmann/json.hpp>
 #include "httplib.h"
 #include "chat.h"
+#include <cxxmcp/client.hpp>
 
 inline const char * ANVIL_LOGO = R"(
    ░███                          ░██░██
@@ -586,6 +587,8 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string image_path;
+    std::string tool_calls_json;
+    std::string tool_call_id;
 };
 
 struct GenStats {
@@ -745,7 +748,8 @@ CliArgs parse_args(int argc, char ** argv) {
 
     const std::string first = argv[1];
     if (first == "models" || first == "profile" || first == "rm" || first == "pull" ||
-        first == "serve" || first == "doctor" || first == "self-update" || first == "bench") {
+        first == "serve" || first == "doctor" || first == "self-update" || first == "bench" ||
+        first == "mcp" || first == "eval") {
         a.sub = first;
         for (int i = 2; i < argc; i++) a.sub_args.emplace_back(argv[i]);
         return a;
@@ -1290,6 +1294,8 @@ static bool save_session(const std::string & path, const std::vector<ChatMessage
         j["role"] = m.role;
         j["content"] = m.content;
         if (!m.image_path.empty()) j["image"] = m.image_path;
+        if (!m.tool_calls_json.empty()) j["tool_calls"] = m.tool_calls_json;
+        if (!m.tool_call_id.empty()) j["tool_call_id"] = m.tool_call_id;
         f << j.dump() << "\n";
     }
     f.flush();
@@ -1308,6 +1314,8 @@ static bool load_session(const std::string & path, std::vector<ChatMessage> & ms
             if (j.contains("role")) m.role = j["role"].get<std::string>();
             if (j.contains("content")) m.content = j["content"].get<std::string>();
             if (j.contains("image")) m.image_path = j["image"].get<std::string>();
+            if (j.contains("tool_calls")) m.tool_calls_json = j["tool_calls"].get<std::string>();
+            if (j.contains("tool_call_id")) m.tool_call_id = j["tool_call_id"].get<std::string>();
             msgs.push_back(std::move(m));
         } catch (const nlohmann::json::exception &) {}
     }
@@ -4145,6 +4153,369 @@ static bool maybe_auto_pull(std::string & model, std::string & path, std::string
     }
     return false;
 }
+struct McpServerCfg {
+    std::string name;
+    std::string command;
+    std::vector<std::string> args;
+    bool enabled = true;
+
+    nlohmann::json to_json() const {
+        nlohmann::json j;
+        j["name"] = name;
+        j["command"] = command;
+        j["args"] = args;
+        j["enabled"] = enabled;
+        return j;
+    }
+
+    static McpServerCfg from_json(const nlohmann::json & j) {
+        McpServerCfg c;
+        if (j.contains("name") && j["name"].is_string()) c.name = j["name"].get<std::string>();
+        if (j.contains("command") && j["command"].is_string()) c.command = j["command"].get<std::string>();
+        if (j.contains("args") && j["args"].is_array()) {
+            for (const auto & a : j["args"]) {
+                if (a.is_string()) c.args.push_back(a.get<std::string>());
+            }
+        }
+        if (j.contains("enabled") && j["enabled"].is_boolean()) c.enabled = j["enabled"].get<bool>();
+        return c;
+    }
+};
+
+inline std::string mcp_json_path() { return config_dir() + "/mcp.json"; }
+
+static std::vector<McpServerCfg> load_mcp_servers() {
+    std::vector<McpServerCfg> out;
+    std::ifstream f(mcp_json_path());
+    if (!f) return out;
+    nlohmann::json root;
+    try {
+        f >> root;
+        if (root.contains("servers") && root["servers"].is_array()) {
+            for (const auto & j : root["servers"]) {
+                try { out.push_back(McpServerCfg::from_json(j)); }
+                catch (const nlohmann::json::exception &) {}
+            }
+        }
+    } catch (const nlohmann::json::exception & e) {
+        fprintf(stderr, "\033[33mwarning: %s unreadable (%s)\033[0m\n",
+                mcp_json_path().c_str(), e.what());
+    }
+    return out;
+}
+
+static bool save_mcp_servers(const std::vector<McpServerCfg> & servers) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(config_dir(), ec);
+    nlohmann::json root;
+    root["version"] = 1;
+    root["servers"] = nlohmann::json::array();
+    for (const auto & s : servers) root["servers"].push_back(s.to_json());
+    const std::string tmp = mcp_json_path() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return false;
+        f << root.dump(2) << "\n";
+        f.flush();
+        if (!f) return false;
+    }
+    fs::rename(tmp, mcp_json_path(), ec);
+    return !ec;
+}
+
+struct McpTool {
+    std::string server;
+    std::string name;
+    std::string description;
+    nlohmann::json input_schema;
+};
+
+static std::string mcp_tool_full_name(const McpTool & t) {
+    return "mcp__" + t.server + "__" + t.name;
+}
+
+struct McpClient {
+    std::string name;
+    std::string error;
+    std::vector<McpTool> tools;
+    std::unique_ptr<mcp::client::Client> client;
+
+    bool open_stdio(const std::string & command, const std::vector<std::string> & args) {
+        mcp::client::Client::StdioEndpoint ep;
+        ep.command = command;
+        ep.args = args;
+        try {
+            client = std::make_unique<mcp::client::Client>(
+                mcp::client::Client::connect_stdio(std::move(ep)));
+        } catch (const std::exception & e) {
+            error = e.what();
+            return false;
+        }
+        return client != nullptr;
+    }
+
+    bool open_http(const std::string & url) {
+        try {
+            client = std::make_unique<mcp::client::Client>(
+                mcp::client::Client::connect_streamable_http(url));
+        } catch (const std::exception & e) {
+            error = e.what();
+            return false;
+        }
+        return client != nullptr;
+    }
+
+    bool start() {
+        auto started = client->start();
+        if (!started) { error = started.error().message; return false; }
+        auto init = client->initialize("anvil", ANVIL_VERSION);
+        if (!init) { error = init.error().message; return false; }
+        auto notif = client->notify_initialized();
+        if (!notif) { error = notif.error().message; return false; }
+        auto listed = client->list_all_tools();
+        if (!listed) { error = listed.error().message; return false; }
+        for (const auto & t : *listed) {
+            McpTool mt;
+            mt.server = name;
+            mt.name = t.name;
+            mt.description = t.description;
+            mt.input_schema = t.input_schema;
+            tools.push_back(std::move(mt));
+        }
+        return true;
+    }
+
+    bool call(const std::string & tool, const nlohmann::json & args, std::string & out) {
+        auto res = client->call_raw(tool, args);
+        if (!res) {
+            out = "error: " + res.error().message;
+            return false;
+        }
+        std::string text;
+        for (const auto & block : res->content) {
+            if (block.type == "text" || block.type.empty()) text += block.text;
+            else text += "[" + block.type + " result]";
+        }
+        if (text.empty() && res->structured_content.has_value()) text = res->structured_content->dump();
+        if (text.empty()) text = "(empty result)";
+        out = std::move(text);
+        return true;
+    }
+
+    void stop() {
+        if (client) {
+            try { client->stop(); } catch (...) {}
+        }
+    }
+};
+
+struct McpHost {
+    std::vector<McpServerCfg> servers;
+    std::vector<McpClient> clients;
+
+    size_t tool_count() const {
+        size_t n = 0;
+        for (const auto & c : clients) n += c.tools.size();
+        return n;
+    }
+
+    void connect_all() {
+        servers = load_mcp_servers();
+        for (auto & s : servers) {
+            if (!s.enabled) continue;
+            McpClient c;
+            c.name = s.name;
+            bool ok = false;
+            if (s.command.rfind("http://", 0) == 0 || s.command.rfind("https://", 0) == 0) {
+                ok = c.open_http(s.command);
+            } else {
+                ok = c.open_stdio(s.command, s.args);
+            }
+            if (ok) ok = c.start();
+            if (!ok) {
+                fprintf(stderr, "  mcp %-16s \033[31mfailed: %s\033[0m\n", c.name.c_str(),
+                        c.error.empty() ? "connect error" : c.error.c_str());
+            }
+            clients.push_back(std::move(c));
+        }
+    }
+
+    std::vector<McpTool> all_tools() const {
+        std::vector<McpTool> out;
+        for (const auto & c : clients) {
+            for (const auto & t : c.tools) out.push_back(t);
+        }
+        return out;
+    }
+
+    bool call(const std::string & full_name, const nlohmann::json & args, std::string & result) {
+        for (auto & c : clients) {
+            for (const auto & t : c.tools) {
+                if (mcp_tool_full_name(t) == full_name) {
+                    return c.call(t.name, args, result);
+                }
+            }
+        }
+        result = "error: MCP tool '" + full_name + "' not found";
+        return false;
+    }
+
+    void shutdown() {
+        for (auto & c : clients) c.stop();
+    }
+};
+
+static nlohmann::ordered_json mcp_tools_to_oai(const std::vector<McpTool> & tools) {
+    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+    for (const auto & t : tools) {
+        nlohmann::ordered_json fn;
+        fn["type"] = "function";
+        fn["function"]["name"] = mcp_tool_full_name(t);
+        fn["function"]["description"] = t.description;
+        if (t.input_schema.is_object() && !t.input_schema.empty()) {
+            fn["function"]["parameters"] = t.input_schema;
+        } else {
+            fn["function"]["parameters"] = nlohmann::ordered_json{
+                {"type", "object"}, {"properties", nlohmann::ordered_json::object()}};
+        }
+        arr.push_back(fn);
+    }
+    return arr;
+}
+
+static nlohmann::ordered_json chat_history_to_oai(const std::vector<ChatMessage> & history) {
+    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+    for (const auto & m : history) {
+        if (m.role == "tool") {
+            nlohmann::ordered_json j;
+            j["role"] = "tool";
+            j["tool_call_id"] = m.tool_call_id;
+            j["content"] = m.content;
+            arr.push_back(std::move(j));
+        } else if (m.role == "assistant" && !m.tool_calls_json.empty()) {
+            nlohmann::ordered_json j;
+            j["role"] = "assistant";
+            j["content"] = m.content;
+            try { j["tool_calls"] = nlohmann::ordered_json::parse(m.tool_calls_json); }
+            catch (...) { j["tool_calls"] = nlohmann::ordered_json::array(); }
+            arr.push_back(std::move(j));
+        } else {
+            nlohmann::ordered_json j;
+            j["role"] = m.role;
+            j["content"] = m.content;
+            arr.push_back(std::move(j));
+        }
+    }
+    return arr;
+}
+
+static std::string chat_tool_calls_to_json(const std::vector<common_chat_tool_call> & tcs) {
+    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+    for (const auto & tc : tcs) {
+        nlohmann::ordered_json j;
+        j["id"] = tc.id;
+        j["type"] = "function";
+        j["function"]["name"] = tc.name;
+        j["function"]["arguments"] = tc.arguments;
+        arr.push_back(std::move(j));
+    }
+    return arr.dump();
+}
+
+static int cmd_mcp(const std::vector<std::string> & args) {
+    if (args.empty()) {
+        fprintf(stderr, "usage: anvil mcp add <name> <command|url> [args...]\n");
+        fprintf(stderr, "       anvil mcp list\n");
+        fprintf(stderr, "       anvil mcp rm <name>\n");
+        fprintf(stderr, "       anvil mcp test <name>\n");
+        return 1;
+    }
+    const std::string & sub = args[0];
+    std::vector<McpServerCfg> servers = load_mcp_servers();
+
+    if (sub == "add" && args.size() >= 3) {
+        const std::string & name = args[1];
+        if (name.empty()) { fprintf(stderr, "error: server name cannot be empty\n"); return 1; }
+        for (const auto & s : servers) {
+            if (s.name == name) {
+                fprintf(stderr, "\033[31merror: server '%s' already registered\033[0m\n", name.c_str());
+                return 1;
+            }
+        }
+        McpServerCfg cfg;
+        cfg.name = name;
+        cfg.command = args[2];
+        for (size_t i = 3; i < args.size(); i++) cfg.args.push_back(args[i]);
+        servers.push_back(cfg);
+        if (!save_mcp_servers(servers)) {
+            fprintf(stderr, "\033[31merror: could not save %s\033[0m\n", mcp_json_path().c_str());
+            return 1;
+        }
+        printf("Registered MCP server '%s' (%s)\n", name.c_str(), cfg.command.c_str());
+        return 0;
+    }
+    if (sub == "rm" && args.size() >= 2) {
+        const size_t before = servers.size();
+        servers.erase(std::remove_if(servers.begin(), servers.end(),
+            [&](const McpServerCfg & s) { return s.name == args[1]; }), servers.end());
+        if (servers.size() == before) {
+            fprintf(stderr, "\033[31merror: no such server '%s'\033[0m\n", args[1].c_str());
+            return 1;
+        }
+        if (!save_mcp_servers(servers)) {
+            fprintf(stderr, "\033[31merror: could not save %s\033[0m\n", mcp_json_path().c_str());
+            return 1;
+        }
+        printf("Removed MCP server '%s'\n", args[1].c_str());
+        return 0;
+    }
+    if (sub == "list") {
+        printf("\n\033[1;36m── MCP Servers (%zu) ──\033[0m\n", servers.size());
+        for (const auto & s : servers) {
+            printf("  %s %-16s %s", s.enabled ? "\033[32m[on]\033[0m" : "\033[90m[off]\033[0m",
+                   s.name.c_str(), s.command.c_str());
+            for (const auto & a : s.args) printf(" %s", a.c_str());
+            printf("\n");
+        }
+        printf("\n");
+        return 0;
+    }
+    if (sub == "test" && args.size() >= 2) {
+        McpServerCfg * found = nullptr;
+        for (auto & s : servers) {
+            if (s.name == args[1]) { found = &s; break; }
+        }
+        if (!found) {
+            fprintf(stderr, "\033[31merror: no such server '%s'\033[0m\n", args[1].c_str());
+            return 1;
+        }
+        McpClient c;
+        c.name = found->name;
+        bool ok = false;
+        if (found->command.rfind("http://", 0) == 0 || found->command.rfind("https://", 0) == 0) {
+            ok = c.open_http(found->command);
+        } else {
+            ok = c.open_stdio(found->command, found->args);
+        }
+        if (ok) ok = c.start();
+        if (!ok) {
+            fprintf(stderr, "\033[31merror: %s: %s\033[0m\n", found->name.c_str(),
+                    c.error.empty() ? "connect failed" : c.error.c_str());
+            return 1;
+        }
+        printf("\n\033[1;36m── %s (%zu tool(s)) ──\033[0m\n", c.name.c_str(), c.tools.size());
+        for (const auto & t : c.tools) {
+            printf("  %-28s %s\n", t.name.c_str(), t.description.c_str());
+        }
+        printf("\n");
+        c.stop();
+        return 0;
+    }
+    fprintf(stderr, "mcp: unknown subcommand '%s'\n", sub.c_str());
+    return 1;
+}
+
 static int cmd_serve(CliArgs & cli) {
     for (size_t i = 0; i < cli.sub_args.size(); i++) {
         const std::string & a = cli.sub_args[i];
@@ -4265,6 +4636,13 @@ static int cmd_serve(CliArgs & cli) {
     g.cfg = cfg;
     g.model_id = friendly;
 
+    McpHost mcp_host;
+    if (!load_mcp_servers().empty()) {
+        fprintf(stderr, "  mcp        : connecting servers ...\n");
+        mcp_host.connect_all();
+        fprintf(stderr, "  mcp tools  : \033[32m%zu available\033[0m\n", mcp_host.tool_count());
+    }
+
     std::string api_key = cli.api_key;
     if (api_key.empty()) {
         const char * env = std::getenv("ANVIL_API_KEY");
@@ -4341,6 +4719,13 @@ static int cmd_serve(CliArgs & cli) {
             return;
         }
         nlohmann::ordered_json oai = anthropic ? anthropic_to_oai(body) : body;
+        if (mcp_host.tool_count() > 0) {
+            nlohmann::ordered_json merged = mcp_tools_to_oai(mcp_host.all_tools());
+            if (oai.contains("tools") && oai["tools"].is_array()) {
+                for (const auto & t : oai["tools"]) merged.push_back(t);
+            }
+            oai["tools"] = std::move(merged);
+        }
         const bool stream = oai.value("stream", false);
         const std::string id = serve_id(anthropic ? "msg_" : "chatcmpl-");
         ServeResult out;
@@ -4694,6 +5079,7 @@ static std::vector<llama_token> tokenize_render(
     toks.resize(static_cast<size_t>(m));
     return toks;
 }
+
 
 int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
              std::vector<ModelEntry> & models) {
@@ -5052,7 +5438,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                         session_path_str.c_str(), history.size());
                 llama_memory_clear(mem, true);
                 prev_tokens.clear();
-                if (!history.empty()) {
+                bool has_tool_msgs = false;
+                for (const auto & m : history) {
+                    if (m.role == "tool" || !m.tool_calls_json.empty()) { has_tool_msgs = true; break; }
+                }
+                if (!has_tool_msgs && !history.empty()) {
                     std::string formatted;
                     if (render_conversation(false, formatted) && !formatted.empty()) {
                         std::vector<llama_token> all = tokenize_render(vocab, formatted);
@@ -5074,6 +5464,91 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         session_path_str = new_session_path(
             cli.friendly.empty() ? slugify(std::filesystem::path(cli.model).stem().string()) : cli.friendly);
     }
+
+    McpHost mcp_host;
+    common_chat_templates_ptr mcp_tmpls;
+    ServeGenCtx mcp_g;
+    bool mcp_active = false;
+    if (!load_mcp_servers().empty()) {
+        mcp_tmpls = common_chat_templates_init(model.get(), "", "", "");
+        if (mcp_tmpls) {
+            mcp_g.ctx = ctx.get();
+            mcp_g.model = model.get();
+            mcp_g.vocab = vocab;
+            mcp_g.mem = mem;
+            mcp_g.tmpls = mcp_tmpls.get();
+            mcp_g.cfg = cfg;
+            mcp_g.model_id = cli.friendly;
+            fprintf(stderr, "  mcp        : connecting servers ...\n");
+            mcp_host.connect_all();
+            mcp_active = mcp_host.tool_count() > 0;
+            if (mcp_active) {
+                fprintf(stderr, "  mcp tools  : \033[32m%zu available\033[0m\n", mcp_host.tool_count());
+            } else {
+                fprintf(stderr, "  mcp tools  : \033[33mnone available\033[0m\n");
+            }
+        }
+    }
+
+    auto run_mcp_turn = [&](const std::string & user_msg) -> bool {
+        history.push_back({"user", user_msg, ""});
+        constexpr int MAX_ROUNDS = 8;
+        for (int round = 0; round < MAX_ROUNDS; round++) {
+            nlohmann::ordered_json body;
+            body["messages"] = chat_history_to_oai(history);
+            body["tools"] = mcp_tools_to_oai(mcp_host.all_tools());
+            body["stream"] = false;
+            llama_memory_clear(mem, true);
+            prev_tokens.clear();
+            ServeResult out;
+            std::string err;
+            auto emit = [&](const common_chat_msg_diff & d) -> bool {
+                if (!d.content_delta.empty()) md.feed(d.content_delta);
+                return true;
+            };
+            const bool ok = serve_chat(mcp_g, body, emit, out, err, g_interrupted);
+            md.flush();
+            if (!ok) {
+                fprintf(stderr, "\033[31m[mcp] %s\033[0m\n", err.c_str());
+                history.pop_back();
+                return false;
+            }
+            if (!out.msg.tool_calls.empty()) {
+                ChatMessage am;
+                am.role = "assistant";
+                am.content = out.msg.content;
+                am.tool_calls_json = chat_tool_calls_to_json(out.msg.tool_calls);
+                history.push_back(std::move(am));
+                for (const auto & tc : out.msg.tool_calls) {
+                    nlohmann::json args = nlohmann::json::object();
+                    if (!tc.arguments.empty()) {
+                        try { args = nlohmann::json::parse(tc.arguments); }
+                        catch (const nlohmann::json::exception &) {}
+                    }
+                    printf("\n\033[1;36m  \xe2\x9a\x92 %s\033[0m %s\n", tc.name.c_str(), tc.arguments.c_str());
+                    fflush(stdout);
+                    std::string result;
+                    mcp_host.call(tc.name, args, result);
+                    const std::string shown = result.size() > 400
+                        ? result.substr(0, 400) + " \xe2\x80\xa6" : result;
+                    printf("  \xe2\x94\x94\xe2\x94\x80 %s\n\n", shown.c_str());
+                    fflush(stdout);
+                    ChatMessage tr;
+                    tr.role = "tool";
+                    tr.content = result;
+                    tr.tool_call_id = tc.id;
+                    history.push_back(std::move(tr));
+                }
+                save_session(session_path_str, history);
+                continue;
+            }
+            finish_turn(out.msg.content);
+            save_session(session_path_str, history);
+            return true;
+        }
+        fprintf(stderr, "\033[33m[mcp] tool loop exceeded %d rounds; stopping\033[0m\n", MAX_ROUNDS);
+        return true;
+    };
 
     if (cli.prompt.empty()) {
 
@@ -5382,6 +5857,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                     user_msg = "Relevant context:\n\n" + rag_ctx + "Question: " + user_input;
                 }
             }
+            if (mcp_active && pending_image.empty()) {
+                if (!run_mcp_turn(user_msg)) break;
+                append_history_line(user_input);
+                continue;
+            }
             if (!pending_image.empty() && vision.ctx != nullptr) {
                 history.push_back({"user", user_msg, pending_image});
                 pending_image.clear();
@@ -5470,6 +5950,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             append_history_line(user_input);
         }
     } else {
+        if (mcp_active && cli.image.empty()) {
+            run_mcp_turn(cli.prompt);
+            printf("\nExiting.\n");
+            return 0;
+        }
 
         std::string shot_prompt = cli.prompt;
         RagIndex shot_rag;
@@ -5540,6 +6025,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     return 0;
 }
 
+static int cmd_eval(CliArgs & cli) {
+    fprintf(stderr, "anvil eval: coming in v0.7.0\n");
+    return 1;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     install_sigint(anvil_signal_handler);
@@ -5560,6 +6050,8 @@ int main(int argc, char ** argv) {
     if (cli.sub == "bench")   return cmd_bench(cli);
     if (cli.sub == "doctor")  return cmd_doctor(cli.sub_args);
     if (cli.sub == "self-update") return cmd_self_update(cli.sub_args);
+    if (cli.sub == "mcp")     return cmd_mcp(cli.sub_args);
+    if (cli.sub == "eval")    return cmd_eval(cli);
 
     if (cli.model.empty() && !cli.setup) {
         fprintf(stderr, "error: no model specified\n\n");

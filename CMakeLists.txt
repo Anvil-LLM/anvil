@@ -39,6 +39,18 @@ FetchContent_MakeAvailable(ftxui)
 FetchContent_Declare(httplib GIT_REPOSITORY https://github.com/yhirose/cpp-httplib GIT_TAG v0.53.0 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(httplib)
 
+FetchContent_Declare(cxxmcp GIT_REPOSITORY https://github.com/caomengxuan666/cxxmcp GIT_TAG v1.2.5 GIT_SHALLOW TRUE)
+set(CXXMCP_BUILD_SDK OFF CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_PROTOCOL ON CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_CLIENT ON CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(CXXMCP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(CXXMCP_ENABLE_HTTP ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cxxmcp)
+
 add_library(mdtty STATIC
     third_party/mdtty/src/mdtty.cpp
     third_party/mdtty/utf8proc/utf8proc.c
@@ -68,7 +80,8 @@ target_include_directories(anvil PRIVATE src ${LLAMA_DIR}/include ${LLAMA_DIR}/g
 
 target_include_directories(anvil PRIVATE SYSTEM ${LLAMA_DIR}/vendor)
 add_subdirectory(${LLAMA_DIR}/tools/mtmd ${CMAKE_BINARY_DIR}/mtmd-build EXCLUDE_FROM_ALL)
-target_link_libraries(anvil PRIVATE llama llama-common ggml ftxui::ftxui mdtty mtmd httplib::httplib)
+target_link_libraries(anvil PRIVATE llama llama-common ggml ftxui::ftxui mdtty mtmd httplib::httplib cxxmcp::client)
+target_compile_definitions(anvil PRIVATE CXXMCP_ENABLE_HTTP)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(anvil PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
 endif()
