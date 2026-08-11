@@ -6496,9 +6496,399 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     return 0;
 }
 
+
+struct EvalSample {
+    std::string question;
+    std::vector<std::string> choices;
+    std::string answer;
+};
+
+static std::vector<EvalSample> eval_fetch_rows(const std::string & dataset,
+                                                 const std::string & config,
+                                                 const std::string & split, int limit,
+                                                 const std::string & subject = "") {
+    std::vector<EvalSample> out;
+    const std::string base = "https://datasets-server.huggingface.co/rows?dataset=" + dataset +
+                             "&config=" + config + "&split=" + split;
+    size_t offset = 0;
+    while (static_cast<int>(out.size()) < limit) {
+        const std::string body = http_get(base + "&offset=" + std::to_string(offset) + "&length=100");
+        if (body.empty()) break;
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(body);
+        } catch (const nlohmann::json::exception &) { break; }
+        if (!j.contains("rows") || j["rows"].empty()) break;
+        for (const auto & r : j["rows"]) {
+            const auto & row = r["row"];
+            if (!subject.empty() && row.value("subject", std::string()) != subject) continue;
+            EvalSample s;
+            s.question = row.value("question", std::string());
+            if (row.contains("choices")) {
+                for (const auto & c : row["choices"]) {
+                    s.choices.push_back(c.get<std::string>());
+                }
+                if (row.contains("answer") && row["answer"].is_number_integer()) {
+                    const int idx = row["answer"].get<int>();
+                    if (idx >= 0 && idx < 4) {
+                        s.answer = std::string(1, static_cast<char>('A' + idx));
+                    }
+                }
+            } else {
+                s.answer = row.value("answer", std::string());
+            }
+            if (s.question.empty()) continue;
+            out.push_back(std::move(s));
+            if (static_cast<int>(out.size()) >= limit) break;
+        }
+        if (static_cast<int>(out.size()) >= limit) break;
+        offset += 100;
+    }
+    return out;
+}
+
+static std::vector<std::string> eval_csv_split(const std::string & line) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool in_q = false;
+    for (size_t i = 0; i < line.size(); i++) {
+        const char c = line[i];
+        if (c == '"') {
+            if (in_q && i + 1 < line.size() && line[i + 1] == '"') {
+                cur += '"';
+                i++;
+            } else {
+                in_q = !in_q;
+            }
+        } else if (c == ',' && !in_q) {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+static std::string eval_normalize(const std::string & s) {
+    std::string out;
+    for (const unsigned char c : s) {
+        if (std::isdigit(c)) out += static_cast<char>(c);
+    }
+    return out;
+}
+
+static std::string eval_gsm8k_answer(const std::string & out) {
+    size_t pos = out.rfind("####");
+    if (pos != std::string::npos) {
+        pos += 4;
+        while (pos < out.size() && !std::isdigit(static_cast<unsigned char>(out[pos]))) pos++;
+        size_t end = pos;
+        while (end < out.size() && (std::isdigit(static_cast<unsigned char>(out[end])) || out[end] == ',')) end++;
+        if (end > pos) return eval_normalize(out.substr(pos, end - pos));
+    }
+    for (size_t i = out.size(); i-- > 0;) {
+        if (std::isdigit(static_cast<unsigned char>(out[i]))) {
+            size_t end = i + 1;
+            while (i > 0 && (std::isdigit(static_cast<unsigned char>(out[i - 1])) || out[i - 1] == ',')) i--;
+            return eval_normalize(out.substr(i, end - i));
+        }
+    }
+    return "";
+}
+
+static std::string eval_mmlu_answer(const std::string & out) {
+    size_t pos = out.rfind("Answer:");
+    if (pos != std::string::npos) {
+        pos += 7;
+        while (pos < out.size() && (out[pos] == ' ' || out[pos] == ':' || out[pos] == '\n')) pos++;
+        if (pos < out.size() && out[pos] >= 'A' && out[pos] <= 'D') {
+            return std::string(1, out[pos]);
+        }
+    }
+    for (const char c : out) {
+        if (c >= 'A' && c <= 'D') return std::string(1, c);
+    }
+    return "";
+}
+
+static std::vector<EvalSample> eval_load_gsm8k(const std::string & path, int limit) {
+    std::vector<EvalSample> out;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(line);
+            EvalSample s;
+            s.question = j.value("question", std::string());
+            s.answer = j.value("answer", std::string());
+            if (s.question.empty()) continue;
+            out.push_back(std::move(s));
+            if (limit > 0 && static_cast<int>(out.size()) >= limit) break;
+        } catch (const nlohmann::json::exception &) {}
+    }
+    return out;
+}
+
+static std::vector<EvalSample> eval_load_mmlu(const std::string & path, int limit) {
+    std::vector<EvalSample> out;
+    std::ifstream f(path);
+    std::string line;
+    std::getline(f, line);
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        const std::vector<std::string> cols = eval_csv_split(line);
+        if (cols.size() < 6) continue;
+        EvalSample s;
+        s.question = cols[0];
+        for (int i = 1; i <= 4; i++) s.choices.push_back(cols[static_cast<size_t>(i)]);
+        s.answer = cols[5];
+        if (s.answer.size() == 1 && s.answer[0] >= 'A' && s.answer[0] <= 'D') {
+            out.push_back(std::move(s));
+            if (limit > 0 && static_cast<int>(out.size()) >= limit) break;
+        }
+    }
+    return out;
+}
+
+static std::vector<EvalSample> eval_load_jsonl(const std::string & path, int limit) {
+    std::vector<EvalSample> out;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(line);
+            EvalSample s;
+            s.question = j.value("question", std::string());
+            s.answer = j.value("answer", std::string());
+            if (s.question.empty()) continue;
+            out.push_back(std::move(s));
+            if (limit > 0 && static_cast<int>(out.size()) >= limit) break;
+        } catch (const nlohmann::json::exception &) {}
+    }
+    return out;
+}
+
 static int cmd_eval(CliArgs & cli) {
-    fprintf(stderr, "anvil eval: coming in v0.7.0\n");
-    return 1;
+    std::string task = "gsm8k";
+    std::string subject = "astronomy";
+    std::string data_path;
+    std::string out_path;
+    int limit = 30;
+    for (size_t i = 0; i < cli.sub_args.size(); i++) {
+        const std::string & a = cli.sub_args[i];
+        if (a == "--task" && i + 1 < cli.sub_args.size()) {
+            task = cli.sub_args[++i];
+        } else if (a == "--subject" && i + 1 < cli.sub_args.size()) {
+            subject = cli.sub_args[++i];
+        } else if (a == "--limit" && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], limit);
+        } else if (a == "--data" && i + 1 < cli.sub_args.size()) {
+            data_path = cli.sub_args[++i];
+        } else if (a == "--out" && i + 1 < cli.sub_args.size()) {
+            out_path = cli.sub_args[++i];
+        } else if ((a == "--ngl" || a == "--n-gpu-layers") && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], cli.ngl);
+        } else if (a == "--ctx" && i + 1 < cli.sub_args.size()) {
+            parse_int(cli.sub_args[++i], cli.n_ctx);
+        } else if (!a.empty() && a[0] != '-' && cli.model.empty()) {
+            cli.model = a;
+        } else {
+            fprintf(stderr, "eval: unknown option '%s'\n", a.c_str());
+            return 1;
+        }
+    }
+    if (cli.model.empty()) {
+        fprintf(stderr, "usage: anvil eval <model> [--task gsm8k|mmlu5|jsonl] [--limit N] [--subject <name>] [--data <file.jsonl>] [--out <report.json>]\n");
+        return 1;
+    }
+    std::string path, friendly;
+    if (!resolve_model_arg(cli.model, path, friendly)) {
+        fprintf(stderr, "\033[31merror: '%s' is not a file and not a registered model\033[0m\n",
+                cli.model.c_str());
+        return 1;
+    }
+    if (!validate_gguf(path)) {
+        fprintf(stderr, "\033[31merror: %s\033[0m\n", gguf_check_error(path).c_str());
+        return 1;
+    }
+    cli.model = path;
+
+    std::vector<EvalSample> samples;
+    std::vector<EvalSample> shots;
+    if (task == "gsm8k") {
+        if (!data_path.empty()) {
+            samples = eval_load_gsm8k(expand_home(data_path), limit);
+        } else {
+            samples = eval_fetch_rows("openai/gsm8k", "main", "test", limit);
+        }
+    } else if (task == "mmlu5") {
+        if (!data_path.empty()) {
+            samples = eval_load_mmlu(expand_home(data_path), limit);
+        } else {
+            samples = eval_fetch_rows("cais/mmlu", "all", "test", limit, subject);
+            shots = eval_fetch_rows("cais/mmlu", "all", "dev", 5, subject);
+            if (shots.size() > 5) shots.resize(5);
+        }
+    } else if (task == "jsonl") {
+        if (data_path.empty()) {
+            fprintf(stderr, "error: --data <file.jsonl> required for task 'jsonl'\n");
+            return 1;
+        }
+        samples = eval_load_jsonl(expand_home(data_path), limit);
+    } else {
+        fprintf(stderr, "error: unknown task '%s' (gsm8k|mmlu5|jsonl)\n", task.c_str());
+        return 1;
+    }
+    if (samples.empty()) {
+        fprintf(stderr, "\033[31merror: no samples loaded for task '%s'\033[0m\n", task.c_str());
+        return 1;
+    }
+
+    const HWInfo hw = probe_hw();
+    const ModelMeta meta = read_model_meta(path);
+    const int max_ctx = static_cast<int>(meta.trained_ctx);
+    AnvilConfig cfg = config_exists() ? load_config() : AnvilConfig{};
+    if (cli.ngl >= 0) cfg.ngl = cli.ngl;
+    else if (cfg.ngl < 0) cfg.ngl = derive_ngl(hw);
+    if (cli.n_ctx > 0) cfg.n_ctx = cli.n_ctx;
+    if (cfg.n_ctx <= 0) cfg.n_ctx = max_ctx > 0 ? max_ctx : 2048;
+
+    LlamaBackend backend;
+    fprintf(stderr, "Loading model: %s ...\n", path.c_str());
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = cfg.ngl;
+    LlamaModel model(llama_model_load_from_file(path.c_str(), mparams));
+    if (!model) {
+        fprintf(stderr, "\033[31merror: failed to load model '%s'\033[0m\n", path.c_str());
+        return 1;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = static_cast<uint32_t>(cfg.n_ctx);
+    cparams.n_batch = static_cast<uint32_t>(std::min<int>(cfg.n_ctx, 8192));
+    cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
+    cparams.flash_attn_type = cfg.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.type_k = cfg.type_k;
+    cparams.type_v = cfg.type_v;
+    LlamaContext ctx(llama_init_from_model(model, cparams));
+    if (!ctx) {
+        fprintf(stderr, "\033[31merror: failed to create context\033[0m\n");
+        return 1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    AnvilConfig eval_cfg = cfg;
+    eval_cfg.temp = 0.0f;
+    LlamaSampler smpl(build_sampler_chain(vocab, eval_cfg, false, "", 0));
+    if (!smpl) {
+        fprintf(stderr, "\033[31merror: sampler init failed\033[0m\n");
+        return 1;
+    }
+
+    const bool is_mmlu = task == "mmlu5";
+    int correct = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    printf("\n\033[1;36m── anvil eval ──\033[0m\n");
+    printf("  task    : %s%s%s\n", task.c_str(), is_mmlu ? " (subject: " : "",
+           is_mmlu ? subject.c_str() : "");
+    printf("  samples : %zu | limit %d | greedy\n\n", samples.size(), limit);
+    printf("%-5s %-48s %-8s %-8s\n", "#", "QUESTION", "PRED", "GOLD");
+
+    for (size_t i = 0; i < samples.size(); i++) {
+        const EvalSample & s = samples[i];
+        std::string prompt;
+        if (is_mmlu) {
+            prompt = "The following are multiple choice questions about " + subject +
+                     ". Answer with the single correct letter A, B, C, or D.\n\n";
+            for (const auto & sh : shots) {
+                prompt += "Q: " + sh.question + "\n";
+                for (int c = 0; c < 4; c++) {
+                    prompt += std::string(1, static_cast<char>('A' + c)) + ". " + sh.choices[static_cast<size_t>(c)] + "\n";
+                }
+                prompt += "Answer: " + sh.answer + "\n\n";
+            }
+            prompt += "Q: " + s.question + "\n";
+            for (int c = 0; c < 4; c++) {
+                prompt += std::string(1, static_cast<char>('A' + c)) + ". " + s.choices[static_cast<size_t>(c)] + "\n";
+            }
+            prompt += "Answer:";
+        } else {
+            prompt = "Solve the math problem below step by step, then write the final numeric answer after '####'.\n\nQuestion: " +
+                     s.question + "\nAnswer:";
+        }
+        std::vector<llama_token> toks = tokenize_render(vocab, prompt);
+        if (toks.empty()) {
+            printf("%-5zu %-48s \033[31mtok fail\033[0m\n", i + 1, "");
+            continue;
+        }
+        std::vector<llama_token> full;
+        full.reserve(toks.size() + 1);
+        if (llama_vocab_get_add_bos(vocab)) full.push_back(llama_vocab_bos(vocab));
+        full.insert(full.end(), toks.begin(), toks.end());
+        llama_memory_clear(mem, true);
+        const int32_t chunk = static_cast<int32_t>(llama_n_batch(ctx));
+        bool ok = true;
+        for (size_t k = 0; k < full.size(); k += static_cast<size_t>(chunk)) {
+            const size_t nn = std::min<size_t>(static_cast<size_t>(chunk), full.size() - k);
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(full.data() + k),
+                                                    static_cast<int32_t>(nn));
+            if (llama_decode(ctx, batch) != 0) { ok = false; break; }
+        }
+        if (!ok) continue;
+        llama_sampler_reset(smpl.get());
+        std::string gen;
+        for (int n = 0; n < 512; n++) {
+            const int32_t used = llama_memory_seq_pos_max(mem, 0) + 1;
+            if (used >= static_cast<int32_t>(llama_n_ctx(ctx))) break;
+            const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
+            if (llama_vocab_is_eog(vocab, id)) break;
+            gen += token_to_str(vocab, id);
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(&id), 1);
+            if (llama_decode(ctx, batch) != 0) break;
+        }
+        const std::string pred = is_mmlu ? eval_mmlu_answer(gen) : eval_gsm8k_answer(gen);
+        std::string gold = is_mmlu ? s.answer : eval_gsm8k_answer(s.answer);
+        if (gold.empty()) gold = eval_normalize(s.answer);
+        const bool hit = !pred.empty() && pred == gold;
+        if (hit) correct++;
+        std::string q = s.question;
+        if (q.size() > 46) q = q.substr(0, 46) + "...";
+        const std::string disp = (hit ? "\033[32m" : "\033[31m") +
+                                 (pred.empty() ? "-" : pred) + "\033[0m";
+        printf("%-5zu %-48s %-8s %-8s\n", i + 1, q.c_str(), disp.c_str(), gold.c_str());
+        fflush(stdout);
+        if (static_cast<int>(i) % 10 == 9) {
+            fprintf(stderr, "\r  %zu/%zu done (%d correct)", i + 1, samples.size(), correct);
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "\r\033[2K");
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    const double acc = samples.empty() ? 0.0 : 100.0 * correct / static_cast<double>(samples.size());
+    printf("\n\033[1;36m── Results ──\033[0m\n");
+    printf("  accuracy : \033[1m%.2f%%\033[0m (%d/%zu)\n", acc, correct, samples.size());
+    printf("  time     : %.1fs\n\n", elapsed);
+
+    if (!out_path.empty()) {
+        nlohmann::json report;
+        report["task"] = task;
+        report["model"] = path;
+        report["samples"] = samples.size();
+        report["correct"] = correct;
+        report["accuracy"] = std::round(acc * 100.0) / 100.0;
+        report["elapsed_sec"] = std::round(elapsed * 10.0) / 10.0;
+        std::ofstream f(out_path, std::ios::trunc);
+        if (f) {
+            f << report.dump(2) << "\n";
+            printf("  report   : %s\n\n", out_path.c_str());
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char ** argv) {
