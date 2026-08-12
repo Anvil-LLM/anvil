@@ -242,6 +242,15 @@ struct AnvilConfig {
     int       top_k      = 40;
     float     top_p      = 0.95f;
     float     repeat_penalty = 1.1f;
+    float     min_p        = 0.05f;
+    int       repeat_last_n = 64;
+    float     typical      = 1.0f;
+    int       mirostat     = 0;
+    float     mirostat_lr  = 0.1f;
+    float     mirostat_ent = 5.0f;
+    bool      ignore_eos   = false;
+    int       n_batch      = 0;
+    std::string samplers;
     bool      flash_attn = true;
     bool      mtp        = false;
     int       seed       = -1;
@@ -475,6 +484,25 @@ struct CliArgs {
     int         bench_tokens = 32;
     int         bench_ctx   = 0;
     int         slots       = 1;
+    int         seed        = -1;
+    int         n_batch     = 0;
+    int         n_ubatch    = 0;
+    float       min_p       = -1.0f;
+    int         repeat_last_n = -1;
+    float       typical     = -1.0f;
+    int         mirostat    = -1;
+    float       mirostat_lr = -1.0f;
+    float       mirostat_ent = -1.0f;
+    bool        ignore_eos  = false;
+    bool        use_mlock   = false;
+    bool        no_mmap     = false;
+    bool        interactive = false;
+    bool        verbose     = false;
+    float       rope_freq_base  = 0.0f;
+    float       rope_freq_scale = 0.0f;
+    std::string rope_scaling;
+    std::string samplers;
+    std::string file_prompt;
 };
 
 inline constexpr int   MAX_CTX      = INT32_MAX;
@@ -529,6 +557,32 @@ void print_usage() {
     printf("      --resume              Resume the latest session for this model\n");
     printf("      --token <tok>         HF token for gated repos (or HF_TOKEN env)\n");
     printf("      --save                Persist CLI overrides into the model's profile\n\n");
+    printf("llama.cpp compatibility (upstream CLI flags accepted by 'anvil run'):\n");
+    printf("  -m, --model <path>       Model (same as positional arg)\n");
+    printf("  -f, --file <file>        Read the prompt from a file (overrides -p)\n");
+    printf("      --ctx-size <n>       Alias for --ctx\n");
+    printf("      --n-predict <n>      Alias for -n/--max-tokens (also --predict)\n");
+    printf("  -b, --batch-size <n>     Batch size (default: = ctx size)\n");
+    printf("      --seed <n>           RNG seed (default: random)\n");
+    printf("      --min-p <f>          Min-p sampling (default: 0.05, 0 = off)\n");
+    printf("      --repeat-last-n <n>  Last N tokens to penalize (default: 64, 0 = off)\n");
+    printf("      --typical <f>        Typical sampling (default: 1, 1 = off)\n");
+    printf("      --mirostat <0|1|2>   Mirostat sampling mode\n");
+    printf("      --mirostat-lr <f>    Mirostat learning rate (default: 0.1)\n");
+    printf("      --mirostat-ent <f>   Mirostat target entropy (default: 5.0)\n");
+    printf("      --ignore-eos         Do not stop generation at EOS\n");
+    printf("      --mlock              Lock the model in RAM\n");
+    printf("      --no-mmap            Disable memory-mapped model loading\n");
+    printf("  -i, --interactive        Force interactive REPL after a -p prompt\n");
+    printf("  -cnv, --conversation     Same as --interactive\n");
+    printf("      --rope-scaling <t>   none|linear|yarn|longrope\n");
+    printf("      --rope-freq-base <f> RoPE base frequency override\n");
+    printf("      --rope-freq-scale <f> RoPE frequency scaling override\n");
+    printf("      --samplers <list>    Exact chain: penalties;top_k;typical;top_p;min_p;temp;mirostat_v2;dist\n");
+    printf("      --cache-type-k <t>   Alias for --type-k\n");
+    printf("      --cache-type-v <t>   Alias for --type-v\n");
+    printf("  Note: anvil keeps -t = --temp and -s = --system (llama.cpp uses -t for threads\n");
+    printf("  and -s for seed). Use --threads and --seed for those. -fa works like llama.cpp.\n\n");
     printf("Model registry:\n");
     printf("  <model> may be a friendly name (registered via pull/import) or a file path.\n");
     printf("  Per-model settings live in ~/.anvil/models.json (profiles).\n");
@@ -592,14 +646,28 @@ CliArgs parse_args(int argc, char ** argv) {
         if      (arg == "--help" || arg == "-h")                          { a.help = true; }
         else if (arg == "--version")                                      { a.version = true; }
         else if (arg == "--setup")                                        { a.setup = true; }
-        else if ((arg == "-c" || arg == "--ctx") && i + 1 < argc) {
+        else if ((arg == "-c" || arg == "--ctx" || arg == "--ctx-size") && i + 1 < argc) {
             set_int(arg, argv[++i], 1, MAX_CTX, a.n_ctx, a);
         }
         else if ((arg == "-ngl" || arg == "--ngl" || arg == "--n-gpu-layers") && i + 1 < argc) {
 
             set_int(arg, argv[++i], -1, 10000, a.ngl, a);
         }
-        else if ((arg == "-t" || arg == "--temp") && i + 1 < argc) {
+        else if (arg == "-t" && i + 1 < argc) {
+            const std::string val = argv[i + 1];
+            float f = 0.0f;
+            int n = 0;
+            if (parse_float(val, f) && f >= 0.0f && f <= MAX_TEMP) {
+                a.temp = f;
+                i++;
+            } else if (parse_int(val, n) && n >= 1) {
+                a.n_threads = n;
+                i++;
+            } else {
+                set_float("-t", val, 0.0f, MAX_TEMP, a.temp, a);
+            }
+        }
+        else if (arg == "--temp" && i + 1 < argc) {
             set_float(arg, argv[++i], 0.0f, MAX_TEMP, a.temp, a);
         }
         else if (arg == "--top-k" && i + 1 < argc) {
@@ -614,7 +682,7 @@ CliArgs parse_args(int argc, char ** argv) {
         else if (arg == "--threads" && i + 1 < argc) {
             set_int(arg, argv[++i], 1, MAX_THREADS, a.n_threads, a);
         }
-        else if (arg == "--flash-attn")                                   { a.flash_attn = true; }
+        else if (arg == "--flash-attn" || arg == "-fa")                   { a.flash_attn = true; }
         else if (arg == "--no-flash-attn")                                { a.no_flash_attn = true; a.flash_attn = false; }
         else if (arg == "--type-k" && i + 1 < argc)                       { a.type_k = argv[++i]; }
         else if (arg == "--type-v" && i + 1 < argc)                       { a.type_v = argv[++i]; }
@@ -623,7 +691,7 @@ CliArgs parse_args(int argc, char ** argv) {
         else if (arg == "--grammar" && i + 1 < argc)                      { a.grammar = argv[++i]; }
         else if ((arg == "-s" || arg == "--system") && i + 1 < argc)      { a.system_prompt = argv[++i]; }
         else if ((arg == "-p" || arg == "--prompt") && i + 1 < argc)      { a.prompt = argv[++i]; }
-        else if ((arg == "-n" || arg == "--max-tokens") && i + 1 < argc) {
+        else if ((arg == "-n" || arg == "--max-tokens" || arg == "--n-predict" || arg == "--predict") && i + 1 < argc) {
             set_int(arg, argv[++i], -1, INT32_MAX, a.max_tokens, a);
         }
         else if (arg == "--mmproj" && i + 1 < argc)                       { a.mmproj = argv[++i]; }
@@ -640,6 +708,59 @@ CliArgs parse_args(int argc, char ** argv) {
         }
         else if (arg == "--bench-ctx" && i + 1 < argc) {
             set_int(arg, argv[++i], 1, MAX_CTX, a.bench_ctx, a);
+        }
+        else if ((arg == "-m" || arg == "--model") && i + 1 < argc)       { a.model = argv[++i]; }
+        else if ((arg == "-f" || arg == "--file") && i + 1 < argc)        { a.file_prompt = argv[++i]; }
+        else if ((arg == "-b" || arg == "--batch-size") && i + 1 < argc) {
+            set_int(arg, argv[++i], 1, 1000000, a.n_batch, a);
+        }
+        else if (arg == "--ubatch-size" && i + 1 < argc) {
+            set_int(arg, argv[++i], 1, 1000000, a.n_ubatch, a);
+        }
+        else if (arg == "--seed" && i + 1 < argc) {
+            set_int(arg, argv[++i], -1, INT32_MAX, a.seed, a);
+        }
+        else if (arg == "--min-p" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 1.0f, a.min_p, a);
+        }
+        else if (arg == "--repeat-last-n" && i + 1 < argc) {
+            set_int(arg, argv[++i], -1, 1000000, a.repeat_last_n, a);
+        }
+        else if (arg == "--typical" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 1.0f, a.typical, a);
+        }
+        else if (arg == "--mirostat" && i + 1 < argc) {
+            set_int(arg, argv[++i], 0, 2, a.mirostat, a);
+        }
+        else if (arg == "--mirostat-lr" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 1.0f, a.mirostat_lr, a);
+        }
+        else if (arg == "--mirostat-ent" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 100.0f, a.mirostat_ent, a);
+        }
+        else if (arg == "--json-schema") {
+            fprintf(stderr, "error: --json-schema is not supported yet; use --grammar <file> with a GBNF grammar\n");
+            a.invalid = true;
+            a.help = true;
+        }
+        else if (arg == "--ignore-eos")                                    { a.ignore_eos = true; }
+        else if (arg == "--mlock")                                         { a.use_mlock = true; }
+        else if (arg == "--no-mmap")                                       { a.no_mmap = true; }
+        else if ((arg == "-i" || arg == "--interactive" || arg == "-cnv" || arg == "--conversation")) {
+            a.interactive = true;
+        }
+        else if (arg == "-v" || arg == "--verbose")                        { a.verbose = true; }
+        else if (arg == "--cache-type-k" && i + 1 < argc)                  { a.type_k = argv[++i]; }
+        else if (arg == "--cache-type-v" && i + 1 < argc)                  { a.type_v = argv[++i]; }
+        else if (arg == "--rope-scaling" && i + 1 < argc)                  { a.rope_scaling = argv[++i]; }
+        else if (arg == "--rope-freq-base" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 1000000.0f, a.rope_freq_base, a);
+        }
+        else if (arg == "--rope-freq-scale" && i + 1 < argc) {
+            set_float(arg, argv[++i], 0.0f, 10.0f, a.rope_freq_scale, a);
+        }
+        else if ((arg == "--samplers" || arg == "--sampling-seq") && i + 1 < argc) {
+            a.samplers = argv[++i];
         }
         else if (arg[0] != '-')                                           { a.model = arg; }
         else {
@@ -893,6 +1014,16 @@ struct ModelProfile {
                 else if (k == "mtp")            { cfg.mtp = v.get<bool>();         n++; }
                 else if (k == "type_k")         { cfg.type_k = kv_type_from_name(v.get<std::string>()); n++; }
                 else if (k == "type_v")         { cfg.type_v = kv_type_from_name(v.get<std::string>()); n++; }
+                else if (k == "seed")           { cfg.seed = v.get<int>();          n++; }
+                else if (k == "min_p")          { cfg.min_p = v.get<float>();       n++; }
+                else if (k == "repeat_last_n")  { cfg.repeat_last_n = v.get<int>(); n++; }
+                else if (k == "typical")        { cfg.typical = v.get<float>();     n++; }
+                else if (k == "mirostat")       { cfg.mirostat = v.get<int>();      n++; }
+                else if (k == "mirostat_lr")    { cfg.mirostat_lr = v.get<float>(); n++; }
+                else if (k == "mirostat_ent")   { cfg.mirostat_ent = v.get<float>(); n++; }
+                else if (k == "ignore_eos")     { cfg.ignore_eos = v.get<bool>();   n++; }
+                else if (k == "n_batch")        { cfg.n_batch = v.get<int>();       n++; }
+                else if (k == "samplers")       { cfg.samplers = v.get<std::string>(); n++; }
                 else if (k == "system_prompt")  { cfg.system_prompt = v.get<std::string>(); n++; }
             } catch (const nlohmann::json::exception &) {
                 fprintf(stderr, "\033[33mwarning: skipping invalid profile key '%s' (wrong type)\033[0m\n", k.c_str());
@@ -904,7 +1035,9 @@ struct ModelProfile {
     static bool valid_key(const std::string & k) {
         static const char * keys[] = {
             "n_ctx", "ngl", "n_threads", "temp", "top_k", "top_p",
-            "repeat_penalty", "flash_attn", "mtp", "type_k", "type_v", "system_prompt"
+            "repeat_penalty", "flash_attn", "mtp", "type_k", "type_v", "system_prompt",
+            "seed", "min_p", "repeat_last_n", "typical", "mirostat", "mirostat_lr",
+            "mirostat_ent", "ignore_eos", "n_batch", "samplers"
         };
         for (const char * kk : keys) if (k == kk) return true;
         return false;
@@ -5424,14 +5557,62 @@ static void print_ctx_bar(int used, int total) {
 static llama_sampler * build_sampler_chain(
         const llama_vocab * vocab, const AnvilConfig & cfg,
         bool grammar_active, const std::string & grammar_src, int seed) {
-    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    std::vector<std::string> seq;
+    auto push_tok = [&](std::string & cur) {
+        while (!cur.empty() && (cur.front() == ' ' || cur.front() == '\t')) cur.erase(cur.begin());
+        while (!cur.empty() && (cur.back() == ' ' || cur.back() == '\t')) cur.pop_back();
+        if (!cur.empty()) seq.push_back(cur);
+        cur.clear();
+    };
+    if (!cfg.samplers.empty()) {
+        std::string cur;
+        for (const char c : cfg.samplers) {
+            if (c == ';' || c == ',') {
+                push_tok(cur);
+            } else {
+                cur += c;
+            }
+        }
+        push_tok(cur);
+    } else {
+        seq = { "penalties", "top_k", "top_p", "min_p", "temp" };
+        if (cfg.mirostat == 1)      seq.push_back("mirostat");
+        else if (cfg.mirostat == 2) seq.push_back("mirostat_v2");
+        else                        seq.push_back("dist");
+    }
 
-    if (cfg.top_k > 0) llama_sampler_chain_add(smpl, llama_sampler_init_top_k(cfg.top_k));
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(cfg.top_p, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
-    if (cfg.temp > 0.0f) llama_sampler_chain_add(smpl, llama_sampler_init_temp(cfg.temp));
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, cfg.repeat_penalty, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed >= 0 ? static_cast<uint32_t>(seed) : LLAMA_DEFAULT_SEED));
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    for (const auto & name : seq) {
+        if (name == "penalties" && cfg.repeat_last_n != 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(cfg.repeat_last_n, cfg.repeat_penalty, 0.0f, 0.0f));
+        } else if (name == "top_k" && cfg.top_k > 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(cfg.top_k));
+        } else if (name == "typical" && cfg.typical > 0.0f && cfg.typical < 1.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_typical(cfg.typical, 1));
+        } else if (name == "top_p" && cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(cfg.top_p, 1));
+        } else if (name == "min_p" && cfg.min_p > 0.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_min_p(cfg.min_p, 1));
+        } else if (name == "temp" && cfg.temp > 0.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(cfg.temp));
+        } else if (name == "mirostat" && cfg.mirostat == 1) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_mirostat(
+                llama_vocab_n_tokens(vocab),
+                seed >= 0 ? static_cast<uint32_t>(seed) : LLAMA_DEFAULT_SEED,
+                cfg.mirostat_ent, cfg.mirostat_lr, 100));
+        } else if (name == "mirostat_v2" && cfg.mirostat == 2) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_mirostat_v2(
+                seed >= 0 ? static_cast<uint32_t>(seed) : LLAMA_DEFAULT_SEED,
+                cfg.mirostat_ent, cfg.mirostat_lr));
+        } else if (name == "dist") {
+            llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed >= 0 ? static_cast<uint32_t>(seed) : LLAMA_DEFAULT_SEED));
+        } else if (name == "dry" || name == "xtc") {
+            fprintf(stderr, "warning: sampler '%s' is not supported in this build; skipping\n", name.c_str());
+        } else if (name != "grammar") {
+            fprintf(stderr, "warning: unknown sampler '%s' (known: penalties, top_k, typical, top_p, min_p, temp, mirostat, mirostat_v2, dist)\n",
+                    name.c_str());
+        }
+    }
     if (grammar_active) {
         llama_sampler * g = llama_sampler_init_grammar(vocab, grammar_src.c_str(), "root");
         if (g) llama_sampler_chain_add(smpl, g);
@@ -5459,7 +5640,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
              std::vector<ModelEntry> & models) {
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = cfg.ngl;
-    mparams.use_mmap = true;
+    mparams.use_mmap = !cli.no_mmap;
+    mparams.use_mlock = cli.use_mlock;
     fprintf(stderr, "Loading model: %s ...\n", cli.model.c_str());
     const auto load_start = std::chrono::steady_clock::now();
     LlamaModel model(llama_model_load_from_file(cli.model.c_str(), mparams));
@@ -5522,7 +5704,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = static_cast<uint32_t>(cfg.n_ctx);
-    cparams.n_batch   = cparams.n_ctx;
+    cparams.n_batch   = cfg.n_batch > 0 ? static_cast<uint32_t>(cfg.n_batch) : cparams.n_ctx;
+    if (cli.n_ubatch > 0) cparams.n_ubatch = static_cast<uint32_t>(cli.n_ubatch);
 
     cparams.n_threads = cfg.n_threads > 0 ? cfg.n_threads : hw.cpu_threads;
     cparams.flash_attn_type = cfg.flash_attn
@@ -5530,6 +5713,12 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k = cfg.type_k;
     cparams.type_v = cfg.type_v;
+    if (cli.rope_freq_base > 0.0f)  cparams.rope_freq_base  = cli.rope_freq_base;
+    if (cli.rope_freq_scale > 0.0f) cparams.rope_freq_scale = cli.rope_freq_scale;
+    if (cli.rope_scaling == "linear")         cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR;
+    else if (cli.rope_scaling == "yarn")     cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+    else if (cli.rope_scaling == "longrope") cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LONGROPE;
+    else if (cli.rope_scaling == "none")     cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE;
     if (cfg.mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
@@ -5557,7 +5746,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         }
     }
 
-    LlamaSampler smpl(build_sampler_chain(vocab, cfg, grammar_active, grammar_src));
+    LlamaSampler smpl(build_sampler_chain(vocab, cfg, grammar_active, grammar_src, cfg.seed));
     if (!smpl) {
         fprintf(stderr, "\033[31merror: failed to initialize sampler chain\033[0m\n");
         return 1;
@@ -5652,7 +5841,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 break;
             }
             const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
-            if (llama_vocab_is_eog(vocab, id)) break;
+            if (!cfg.ignore_eos && llama_vocab_is_eog(vocab, id)) break;
 
             const std::string piece = token_to_str(vocab, id);
             const std::string printable = utf8_buf.feed(piece);
@@ -5973,7 +6162,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    if (cli.prompt.empty()) {
+    if (cli.prompt.empty() || cli.interactive) {
+        std::string first_prompt = cli.prompt;
 
         while (true) {
             g_interrupted = 0;
@@ -5993,7 +6183,10 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             fflush(stdout);
 
             std::string user_input;
-            if (!std::getline(std::cin, user_input)) break;
+            if (!first_prompt.empty()) {
+                user_input = first_prompt;
+                first_prompt.clear();
+            } else if (!std::getline(std::cin, user_input)) break;
             while (!user_input.empty() && (user_input.back() == '\n' || user_input.back() == '\r'))
                 user_input.pop_back();
             if (g_interrupted) break;
@@ -7055,6 +7248,15 @@ int main(int argc, char ** argv) {
                 static_cast<int>(entry->profile.settings.size()));
     }
 
+    if (!cli.file_prompt.empty()) {
+        std::ifstream pf(cli.file_prompt);
+        if (!pf) {
+            fprintf(stderr, "\033[31merror: cannot open prompt file '%s'\033[0m\n", cli.file_prompt.c_str());
+            return 1;
+        }
+        cli.prompt.assign(std::istreambuf_iterator<char>(pf), std::istreambuf_iterator<char>());
+    }
+
     if (cli.n_ctx > 0)          cfg.n_ctx = cli.n_ctx;
     if (cfg.n_ctx <= 0 && max_ctx > 0) cfg.n_ctx = max_ctx;
     if (cli.ngl >= 0)           cfg.ngl = cli.ngl;
@@ -7069,6 +7271,16 @@ int main(int argc, char ** argv) {
     if (cli.mtp)                cfg.mtp = true;
     if (!cli.type_k.empty())    cfg.type_k = kv_type_from_name(cli.type_k);
     if (!cli.type_v.empty())    cfg.type_v = kv_type_from_name(cli.type_v);
+    if (cli.seed >= 0)          cfg.seed = cli.seed;
+    if (cli.n_batch > 0)        cfg.n_batch = cli.n_batch;
+    if (cli.min_p >= 0)         cfg.min_p = cli.min_p;
+    if (cli.repeat_last_n >= 0) cfg.repeat_last_n = cli.repeat_last_n;
+    if (cli.typical >= 0)       cfg.typical = cli.typical;
+    if (cli.mirostat >= 0)      cfg.mirostat = cli.mirostat;
+    if (cli.mirostat_lr >= 0)   cfg.mirostat_lr = cli.mirostat_lr;
+    if (cli.mirostat_ent >= 0)  cfg.mirostat_ent = cli.mirostat_ent;
+    if (cli.ignore_eos)         cfg.ignore_eos = true;
+    if (!cli.samplers.empty())  cfg.samplers = cli.samplers;
 
     if (cli.system_prompt.size() > 1 && cli.system_prompt[0] == '@' && !load_preset_text(cli.system_prompt).empty()) {
         cfg.system_prompt = load_preset_text(cli.system_prompt);
@@ -7091,6 +7303,16 @@ int main(int argc, char ** argv) {
 
         if (!cli.type_k.empty() && valid_kv_name(cli.type_k)) p.set("type_k", cli.type_k);
         if (!cli.type_v.empty() && valid_kv_name(cli.type_v)) p.set("type_v", cli.type_v);
+        if (cli.seed >= 0)               p.set("seed", cli.seed);
+        if (cli.min_p >= 0)              p.set("min_p", cli.min_p);
+        if (cli.repeat_last_n >= 0)      p.set("repeat_last_n", cli.repeat_last_n);
+        if (cli.typical >= 0)            p.set("typical", cli.typical);
+        if (cli.mirostat >= 0)           p.set("mirostat", cli.mirostat);
+        if (cli.mirostat_lr >= 0)        p.set("mirostat_lr", cli.mirostat_lr);
+        if (cli.mirostat_ent >= 0)       p.set("mirostat_ent", cli.mirostat_ent);
+        if (cli.ignore_eos)              p.set("ignore_eos", true);
+        if (cli.n_batch > 0)             p.set("n_batch", cli.n_batch);
+        if (!cli.samplers.empty())       p.set("samplers", cli.samplers);
         if (!cli.system_prompt.empty())  p.set("system_prompt", cli.system_prompt);
         save_models(models);
         fprintf(stderr, "Saved %zu setting(s) to profile '%s'\n", p.settings.size(), friendly.c_str());
