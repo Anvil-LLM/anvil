@@ -6105,7 +6105,8 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         llama_sampler_reset(sum_smpl.get());
         std::string acc;
         int n = 0;
-        while (n < 800) {
+        while (n < 512) {
+            if (g_interrupted) break;
             const int32_t used = llama_memory_seq_pos_max(mem, 0) + 1;
             if (used >= static_cast<int32_t>(llama_n_ctx(ctx))) break;
             const llama_token id = llama_sampler_sample(sum_smpl.get(), ctx, -1);
@@ -6165,18 +6166,24 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     if (cli.prompt.empty() || cli.interactive) {
         std::string first_prompt = cli.prompt;
 
+        std::thread compaction_thread;
+        std::atomic<bool> compaction_running{false};
         while (true) {
             g_interrupted = 0;
             int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
             const uint32_t n_ctx_total = llama_n_ctx(ctx);
             if (n_ctx_used > 0 && n_ctx_total > 0 &&
                 static_cast<double>(n_ctx_used) / n_ctx_total > 0.75 &&
-                history.size() > 6) {
-                if (!compact_history()) {
-                    fprintf(stderr, "\033[33m⚠ context at %d/%u; compaction unavailable\033[0m\n",
-                            n_ctx_used, static_cast<int>(n_ctx_total));
-                }
-                n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
+                history.size() > 6 && !compaction_running) {
+                compaction_running = true;
+                fprintf(stderr, "\033[2m⟳ Compacting context in background…\033[0m\n");
+                compaction_thread = std::thread([&]() {
+                    if (!compact_history()) {
+                        fprintf(stderr, "\033[33m⚠ context compaction unavailable\033[0m\n");
+                    }
+                    compaction_running = false;
+                });
+                n_ctx_used = 0;
             }
             if (n_ctx_used > 0) print_ctx_bar(n_ctx_used, static_cast<int>(llama_n_ctx(ctx)));
             printf("\033[32m> \033[0m");
@@ -6186,9 +6193,13 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             if (!first_prompt.empty()) {
                 user_input = first_prompt;
                 first_prompt.clear();
-            } else if (!std::getline(std::cin, user_input)) break;
+            } else if (!std::getline(std::cin, user_input)) {
+                if (compaction_thread.joinable()) compaction_thread.join();
+                break;
+            }
             while (!user_input.empty() && (user_input.back() == '\n' || user_input.back() == '\r'))
                 user_input.pop_back();
+            if (compaction_thread.joinable()) compaction_thread.join();
             if (g_interrupted) break;
             if (user_input.empty()) continue;
 
