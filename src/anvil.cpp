@@ -5875,34 +5875,44 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return decode_ok;
     };
 
+    std::function<bool()> compact_history;
+    std::thread compaction_thread;
+    std::atomic<bool> compaction_running{false};
+
     auto start_turn = [&](std::string & formatted) -> bool {
-        std::vector<llama_token> all = tokenize_render(vocab, formatted);
-        if (all.empty()) {
-            fprintf(stderr, "\033[31mtokenization failed\033[0m\n");
-            return false;
-        }
-        if (!prev_tokens.empty()) {
-
-            if (prev_tokens.size() <= all.size() &&
-                std::equal(prev_tokens.begin(), prev_tokens.end(), all.begin())) {
-                std::vector<llama_token> delta(all.begin() + static_cast<long>(prev_tokens.size()), all.end());
-                if (delta.empty()) return true;
-                if (!decode_tokens(delta)) return false;
-                prev_tokens = std::move(all);
-                return true;
+        auto attempt = [&]() -> bool {
+            std::vector<llama_token> all = tokenize_render(vocab, formatted);
+            if (all.empty()) {
+                fprintf(stderr, "\033[31mtokenization failed\033[0m\n");
+                return false;
             }
-
-            llama_memory_clear(mem, true);
-            prev_tokens.clear();
+            if (!prev_tokens.empty()) {
+                if (prev_tokens.size() <= all.size() &&
+                    std::equal(prev_tokens.begin(), prev_tokens.end(), all.begin())) {
+                    std::vector<llama_token> delta(all.begin() + static_cast<long>(prev_tokens.size()), all.end());
+                    if (delta.empty()) return true;
+                    if (!decode_tokens(delta)) return false;
+                    prev_tokens = std::move(all);
+                    return true;
+                }
+                llama_memory_clear(mem, true);
+                prev_tokens.clear();
+            }
+            std::vector<llama_token> full;
+            full.reserve(all.size() + 1);
+            if (add_bos && (all.empty() || all[0] != bos_id)) full.push_back(bos_id);
+            full.insert(full.end(), all.begin(), all.end());
+            if (!decode_tokens(full)) return false;
+            prev_tokens = std::move(all);
+            return true;
+        };
+        if (attempt()) return true;
+        if (compaction_thread.joinable()) compaction_thread.join();
+        if (!compaction_running && compact_history() && render_conversation(true, formatted)) {
+            if (attempt()) return true;
         }
-
-        std::vector<llama_token> full;
-        full.reserve(all.size() + 1);
-        if (add_bos && (all.empty() || all[0] != bos_id)) full.push_back(bos_id);
-        full.insert(full.end(), all.begin(), all.end());
-        if (!decode_tokens(full)) return false;
-        prev_tokens = std::move(all);
-        return true;
+        fprintf(stderr, "\033[33m⚠ message dropped: could not fit the conversation into context\033[0m\n");
+        return false;
     };
 
     auto finish_turn = [&](const std::string & resp) {
@@ -6091,7 +6101,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return true;
     };
 
-    auto summarize_quiet = [&](const std::string & prompt, std::string & out) -> bool {
+    auto summarize_quiet = [&](const std::string & prompt, std::string & out, int max_tokens) -> bool {
         std::vector<llama_token> toks = tokenize_render(vocab, prompt);
         if (toks.empty()) return false;
         llama_memory_clear(mem, true);
@@ -6105,7 +6115,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         llama_sampler_reset(sum_smpl.get());
         std::string acc;
         int n = 0;
-        while (n < 512) {
+        while (n < max_tokens) {
             if (g_interrupted) break;
             const int32_t used = llama_memory_seq_pos_max(mem, 0) + 1;
             if (used >= static_cast<int32_t>(llama_n_ctx(ctx))) break;
@@ -6120,7 +6130,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         return !out.empty();
     };
 
-    auto compact_history = [&]() -> bool {
+    compact_history = [&]() -> bool {
         if (history.size() <= 6) return false;
         std::string sys;
         size_t first_keep = 0;
@@ -6145,8 +6155,12 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             "Summarize this conversation into one concise paragraph. Preserve every concrete fact, number, decision, and open task. Omit greetings and small talk.\n\n" +
             dump + "\nSummary:";
         std::string summary;
-        if (!summarize_quiet(prompt, summary)) return false;
-        if (summary.size() > 2400) summary.resize(2400);
+        int sum_budget = static_cast<int32_t>(llama_n_ctx(ctx)) / 8;
+        if (sum_budget < 32) sum_budget = 32;
+        if (sum_budget > 512) sum_budget = 512;
+        if (!summarize_quiet(prompt, summary, sum_budget)) return false;
+        const size_t max_chars = std::max<size_t>(128, static_cast<size_t>(llama_n_ctx(ctx)) / 2);
+        if (summary.size() > max_chars) summary.resize(max_chars);
         std::vector<ChatMessage> kept;
         if (!sys.empty()) {
             kept.push_back({"system", sys, ""});
@@ -6154,6 +6168,20 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
         kept.push_back({"system", "[Summary of earlier conversation]\n" + summary, ""});
         for (size_t i = keep_from; i < history.size(); i++) kept.push_back(history[i]);
         history = std::move(kept);
+        {
+            const int32_t half = static_cast<int32_t>(llama_n_ctx(ctx)) / 2;
+            std::string rendered;
+            while (history.size() > 1) {
+                rendered.clear();
+                if (!render_conversation(false, rendered)) break;
+                std::vector<llama_token> toks = tokenize_render(vocab, rendered);
+                if (toks.empty() || static_cast<int32_t>(toks.size()) <= half) break;
+                size_t drop = 0;
+                while (drop < history.size() && history[drop].role == "system") drop++;
+                if (drop >= history.size()) break;
+                history.erase(history.begin() + static_cast<long>(drop));
+            }
+        }
         llama_memory_clear(mem, true);
         prev_tokens.clear();
         fprintf(stderr, "\n\033[1;36m── Context compacted ──\033[0m\n");
@@ -6166,8 +6194,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     if (cli.prompt.empty() || cli.interactive) {
         std::string first_prompt = cli.prompt;
 
-        std::thread compaction_thread;
-        std::atomic<bool> compaction_running{false};
         while (true) {
             g_interrupted = 0;
             int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
@@ -6175,6 +6201,7 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
             if (n_ctx_used > 0 && n_ctx_total > 0 &&
                 static_cast<double>(n_ctx_used) / n_ctx_total > 0.75 &&
                 history.size() > 6 && !compaction_running) {
+                if (compaction_thread.joinable()) compaction_thread.join();
                 compaction_running = true;
                 fprintf(stderr, "\033[2m⟳ Compacting context in background…\033[0m\n");
                 compaction_thread = std::thread([&]() {
