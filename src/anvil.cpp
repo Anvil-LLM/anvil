@@ -75,7 +75,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.8.3";
+inline const char * ANVIL_VERSION = "0.8.4";
 inline const int    CONFIG_VERSION = 2;
 
 inline volatile sig_atomic_t g_interrupted = 0;
