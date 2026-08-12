@@ -75,7 +75,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.8.1";
+inline const char * ANVIL_VERSION = "0.8.2";
 inline const int    CONFIG_VERSION = 2;
 
 inline volatile sig_atomic_t g_interrupted = 0;
@@ -84,11 +84,15 @@ inline void anvil_signal_handler(int) {
 }
 
 inline void install_sigint(void (*handler)(int), bool restart = true) {
+#ifdef _WIN32
+    signal(SIGINT, handler);
+#else
     struct sigaction sa {};
     sa.sa_handler = handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = restart ? SA_RESTART : 0;
     sigaction(SIGINT, &sa, nullptr);
+#endif
 }
 
 struct LlamaModel {
