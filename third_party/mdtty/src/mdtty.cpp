@@ -542,6 +542,7 @@ void Renderer::finish_line(bool allow_empty) {
     }
     emit_raw("\n");
   } else if (allow_empty || !line_buf_.empty() || in_fence_) {
+    emit_style(cfg_.reset);
     process_line(line_buf_);
   }
   line_buf_.clear();
@@ -645,6 +646,7 @@ void Renderer::commit_line(const std::string & b, const LineDecision & d) {
   if (!table_buf_.empty() && !in_fence_) {
     flush_table();
   }
+  emit_style(cfg_.reset);
   switch (d.kind) {
     case LineDecision::Kind::Plain:
       for (char c : b) {

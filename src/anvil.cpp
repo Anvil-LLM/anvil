@@ -325,7 +325,20 @@ struct MarkdownStream {
 
     static mdtty::Config think_config() {
         mdtty::Config tc;
-        tc.reset = "\033[0;2m";
+        tc.reset       = "\033[0;2m";
+        tc.bold        = "\033[0;1m";
+        tc.italic      = "\033[0;3m";
+        tc.code_inline = "\033[0;38;5;220m";
+        tc.code_block  = "\033[0;38;5;114m";
+        tc.heading     = {{
+            "\033[0;1m\033[38;5;199m", "\033[0;1m\033[38;5;39m",
+            "\033[0;1m\033[38;5;49m",  "\033[0;1m\033[38;5;114m",
+            "\033[0;1m\033[38;5;220m", "\033[0;2m\033[38;5;245m",
+        }};
+        tc.quote       = "\033[0;2m\033[3m";
+        tc.hr          = "\033[0;2m";
+        tc.table       = "\033[0;2m";
+        tc.table_head  = "\033[0;1m";
         return tc;
     }
 
