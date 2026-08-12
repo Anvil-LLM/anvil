@@ -298,25 +298,12 @@ struct Utf8Buffer {
 };
 
 struct MarkdownStream {
-    mdtty::Config resp_cfg;
-    mdtty::Config think_cfg;
-
     mdtty::Renderer resp_s;
     mdtty::Renderer think_s;
 
-    std::string raw;
     std::string pending;
-    std::string last_render;
-    size_t rendered_up_to = 0;
     bool color = false;
     bool in_think_s = false;
-    bool first = true;
-    bool live = true;
-    std::chrono::steady_clock::time_point last_draw;
-
-    static constexpr std::chrono::milliseconds DRAW_MS{35};
-
-    static constexpr int SCREEN_MARGIN = 8;
 
     static void sink_out(std::string_view s) {
         std::fwrite(s.data(), 1, s.size(), stdout);
@@ -368,150 +355,6 @@ struct MarkdownStream {
         return 0;
     }
 
-    std::string render_all(const std::string & doc) {
-        std::string out, seg;
-        bool in_think = false;
-        auto flush_seg = [&]() {
-            if (seg.empty()) return;
-            if (in_think) {
-                out += color ? "\033[2;90m┌─ Thinking ─\033[0m\n" : "┌─ Thinking ─\n";
-                out += mdtty::Renderer::render(seg, think_cfg);
-                out += color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n";
-            } else {
-                out += mdtty::Renderer::render(seg, resp_cfg);
-            }
-            seg.clear();
-        };
-        size_t i = 0;
-        while (i < doc.size()) {
-            size_t len = 0;
-            if (tag_at(doc, i, true, len)) {
-                if (in_think) { flush_seg(); in_think = false; i += len; continue; }
-                i += len;
-                continue;
-            }
-            if (!in_think && tag_at(doc, i, false, len)) {
-                flush_seg();
-                in_think = true;
-                i += len;
-                continue;
-            }
-            seg.push_back(doc[i++]);
-        }
-        flush_seg();
-        return out;
-    }
-
-    static int terminal_cols() {
-#if defined(_WIN32)
-        CONSOLE_SCREEN_BUFFER_INFO csbi{};
-        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0) {
-            const int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
-            if (w > 0) return w;
-        }
-#else
-        struct winsize ws{};
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-            return static_cast<int>(ws.ws_col);
-        }
-#endif
-        return 80;
-    }
-
-    static int terminal_rows() {
-#if defined(_WIN32)
-        CONSOLE_SCREEN_BUFFER_INFO csbi{};
-        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi) != 0) {
-            const int h = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
-            if (h > 0) return h;
-        }
-#else
-        struct winsize ws{};
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
-            return static_cast<int>(ws.ws_row);
-        }
-#endif
-        return 24;
-    }
-
-    static int cell_width(uint32_t cp) {
-        if (cp < 0x80u) return 1;
-        if (cp == 0u) return 0;
-        if ((cp >= 0x0300u && cp <= 0x036Fu) || (cp >= 0x1AB0u && cp <= 0x1AFFu) ||
-            (cp >= 0x1DC0u && cp <= 0x1DFFu) || (cp >= 0x20D0u && cp <= 0x20FFu) ||
-            (cp >= 0xFE20u && cp <= 0xFE2Fu)) return 0;
-        if ((cp >= 0x1100u && cp <= 0x115Fu) || (cp >= 0x2E80u && cp <= 0xA4CFu) ||
-            (cp >= 0xAC00u && cp <= 0xD7A3u) || (cp >= 0xF900u && cp <= 0xFAFFu) ||
-            (cp >= 0xFE30u && cp <= 0xFE4Fu) || (cp >= 0xFF00u && cp <= 0xFF60u) ||
-            (cp >= 0xFFE0u && cp <= 0xFFE6u) || (cp >= 0x1F300u && cp <= 0x1FAFFu) ||
-            (cp >= 0x20000u && cp <= 0x3FFFDu)) return 2;
-        return 1;
-    }
-
-    static int count_rows(const std::string & rendered) {
-        const int cols = terminal_cols();
-        int rows = 0;
-        int width = 0;
-        size_t i = 0;
-        while (i < rendered.size()) {
-            if (rendered[i] == '\033' && i + 1 < rendered.size() && rendered[i + 1] == '[') {
-                i += 2;
-                while (i < rendered.size() && !(rendered[i] >= '@' && rendered[i] <= '~')) ++i;
-                if (i < rendered.size()) ++i;
-                continue;
-            }
-            const auto byte = [&](size_t k) {
-                return static_cast<unsigned char>(rendered[k]);
-            };
-            const unsigned char c = byte(i);
-            if (c == '\n') { rows += 1; width = 0; ++i; continue; }
-            uint32_t cp = c;
-            size_t n = 1;
-            if ((c & 0xE0u) == 0xC0u && i + 1 < rendered.size()) {
-                cp = static_cast<uint32_t>((c & 0x1Fu) << 6) |
-                     static_cast<uint32_t>(byte(i + 1) & 0x3Fu);
-                n = 2;
-            } else if ((c & 0xF0u) == 0xE0u && i + 2 < rendered.size()) {
-                cp = static_cast<uint32_t>((c & 0x0Fu) << 12) |
-                     static_cast<uint32_t>((byte(i + 1) & 0x3Fu) << 6) |
-                     static_cast<uint32_t>(byte(i + 2) & 0x3Fu);
-                n = 3;
-            } else if ((c & 0xF8u) == 0xF0u && i + 3 < rendered.size()) {
-                cp = static_cast<uint32_t>((c & 0x07u) << 18) |
-                     static_cast<uint32_t>((byte(i + 1) & 0x3Fu) << 12) |
-                     static_cast<uint32_t>((byte(i + 2) & 0x3Fu) << 6) |
-                     static_cast<uint32_t>(byte(i + 3) & 0x3Fu);
-                n = 4;
-            }
-            width += cell_width(cp);
-            if (width >= cols) { rows += width / cols; width %= cols; }
-            i += n;
-        }
-        return rows;
-    }
-
-    void draw() {
-
-        const size_t hold = partial_suffix(raw);
-        const std::string view = raw.substr(0, raw.size() - hold);
-        const std::string rendered = render_all(view);
-        const int old_rows = count_rows(last_render);
-        if (old_rows >= terminal_rows() - SCREEN_MARGIN) {
-            live = false;
-            pending = raw.substr(rendered_up_to);
-            return;
-        }
-        if (live && !first && old_rows > 0) {
-            printf("\033[%dA", old_rows);
-            printf("\033[J");
-        }
-        fputs(rendered.c_str(), stdout);
-        fflush(stdout);
-        last_render = rendered;
-        first = false;
-        rendered_up_to = view.size();
-    }
-
     void drain_s(bool force = false) {
         while (!pending.empty()) {
             size_t tag_i = std::string::npos;
@@ -552,38 +395,20 @@ struct MarkdownStream {
     }
 
     void feed(const std::string & s) {
-        if (!color || !live) {
-            pending += s;
-            drain_s(false);
-            return;
-        }
-        raw += s;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_draw >= DRAW_MS) {
-            last_draw = now;
-            draw();
-        }
+        pending += s;
+        drain_s(false);
     }
 
     void flush() {
-        if (color && live) {
-            draw();
-        } else {
-            drain_s(true);
-            (in_think_s ? think_s : resp_s).flush();
-            if (in_think_s) {
-                printf(color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n");
-                in_think_s = false;
-            }
+        drain_s(true);
+        (in_think_s ? think_s : resp_s).flush();
+        if (in_think_s) {
+            printf(color ? "\033[2;90m└─ /Thinking ─\033[0m\n" : "└─ /Thinking ─\n");
+            in_think_s = false;
         }
         resp_s.reset();
         think_s.reset();
-        raw.clear();
         pending.clear();
-        last_render.clear();
-        rendered_up_to = 0;
-        first = true;
-        live = true;
     }
 };
 
@@ -4363,8 +4188,15 @@ struct VisionSession {
             mtmd_input_chunks_free(chunks);
             return false;
         }
+        std::string prompt = formatted;
+        const char * marker = mtmd_get_marker(ctx);
+        if (marker && prompt.find(marker) == std::string::npos) {
+            prompt += "\n";
+            prompt += marker;
+            prompt += "\n";
+        }
         mtmd_input_text text;
-        text.text = formatted.c_str();
+        text.text = prompt.c_str();
         text.add_special = true;
         text.parse_special = true;
         const mtmd_bitmap * bm = bw.bitmap;
@@ -5799,20 +5631,11 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
     };
 
     MarkdownStream md;
-    bool stderr_tty = false;
-#ifdef _WIN32
-    stderr_tty = _isatty(_fileno(stderr)) != 0;
-#else
-    stderr_tty = isatty(STDERR_FILENO) != 0;
-#endif
-    static const char HUD_SPIN[] = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
     auto generate = [&](std::string & response, GenStats & stats) -> bool {
         llama_sampler_reset(smpl.get());
         const auto gen_start = std::chrono::steady_clock::now();
         bool decode_ok = true;
         bool stopped = false;
-        auto hud_next = std::chrono::steady_clock::now();
-        int spin = 0;
         while (true) {
             const int32_t n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
             if (n_ctx_used >= static_cast<int32_t>(llama_n_ctx(ctx))) {
@@ -5828,19 +5651,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 stopped = true;
                 break;
             }
-            if (stderr_tty) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now >= hud_next) {
-                    const double el = std::chrono::duration<double>(now - gen_start).count();
-                    const double tps = el > 0.0 ? stats.tokens_generated / el : 0.0;
-                    fprintf(stderr, "\r\033[2K  %c %d tok | %.1f t/s",
-                            HUD_SPIN[spin % 10], stats.tokens_generated, tps);
-                    fflush(stderr);
-                    spin++;
-                    hud_next = now + std::chrono::milliseconds(150);
-                }
-            }
-
             const llama_token id = llama_sampler_sample(smpl.get(), ctx, -1);
             if (llama_vocab_is_eog(vocab, id)) break;
 
@@ -5861,7 +5671,6 @@ int run_chat(const CliArgs & cli, AnvilConfig cfg, const HWInfo & hw,
                 break;
             }
         }
-        if (stderr_tty) fprintf(stderr, "\r\033[2K");
         const std::string tail = utf8_buf.flush();
         if (!tail.empty()) {
             md.feed(tail);
