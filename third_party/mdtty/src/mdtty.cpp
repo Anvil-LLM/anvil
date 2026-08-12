@@ -322,14 +322,26 @@ Renderer::Renderer(Sink sink, Config cfg) : sink_(std::move(sink)), cfg_(cfg) {
 }
 
 void Renderer::emit_raw(std::string_view s) {
-  if (!s.empty() && sink_) {
-    sink_(s);
+  if (!s.empty()) {
+    out_buf_.append(s.data(), s.size());
   }
 }
 
-void Renderer::emit_style(const char *code) {
+void Renderer::flush_out() {
+  if (!out_buf_.empty()) {
+    if (sink_) {
+      sink_(out_buf_);
+    }
+    out_buf_.clear();
+  }
+}
+
+void Renderer::emit_style(const char * code) {
   if (!cfg_.strip_ansi && code != nullptr && code[0] != '\0') {
-    sink_(std::string_view(code));
+    flush_out();
+    if (sink_) {
+      sink_(std::string_view(code));
+    }
   }
 }
 
@@ -346,32 +358,46 @@ int Renderer::terminal_width() {
 void Renderer::feed(std::string_view chunk) {
   for (char c : chunk) {
     if (c == '\n') {
-      process_line(line_buf_);
-      line_buf_.clear();
+      finish_line(true);
+    } else if (line_class_ == LineClass::Streaming) {
+      inline_feed_char(c);
     } else {
       line_buf_.push_back(c);
+      if (!in_fence_) {
+        const LineDecision d = classify_line(line_buf_);
+        if (d.kind != LineDecision::Kind::None) {
+          commit_line(line_buf_, d);
+          line_buf_.clear();
+          line_class_ = LineClass::Streaming;
+          line_dec_   = d;
+        }
+      }
     }
   }
+  flush_out();
 }
 
 void Renderer::flush() {
-  if (!line_buf_.empty()) {
-    process_line(line_buf_);
-    line_buf_.clear();
-  }
+  finish_line(false);
   flush_table();
   if (in_fence_) {
     emit_style(cfg_.reset);
-    in_fence_         = false;
+    in_fence_          = false;
     fence_just_opened_ = false;
   }
+  flush_out();
 }
 
 void Renderer::reset() {
   line_buf_.clear();
-  in_fence_         = false;
+  out_buf_.clear();
+  in_fence_          = false;
   fence_just_opened_ = false;
   table_buf_.clear();
+  line_class_ = LineClass::Ambiguous;
+  line_dec_   = LineDecision{};
+  span_       = Span::None;
+  inline_pending_ = 0;
 }
 
 void Renderer::process_line(std::string_view line) {
@@ -507,6 +533,162 @@ void Renderer::process_line(std::string_view line) {
   emit_raw("\n");
 }
 
+void Renderer::finish_line(bool allow_empty) {
+  if (line_class_ == LineClass::Streaming) {
+    inline_flush();
+    if (line_dec_.kind == LineDecision::Kind::Heading ||
+        line_dec_.kind == LineDecision::Kind::Quote) {
+      emit_style(cfg_.reset);
+    }
+    emit_raw("\n");
+  } else if (allow_empty || !line_buf_.empty() || in_fence_) {
+    process_line(line_buf_);
+  }
+  line_buf_.clear();
+  line_class_ = LineClass::Ambiguous;
+  line_dec_   = LineDecision{};
+}
+
+Renderer::LineDecision Renderer::classify_line(const std::string & b) {
+  LineDecision d;
+  if (b.rfind("```", 0) == 0) {
+    return d;
+  }
+  std::size_t i = 0;
+  while (i < b.size() && b[i] == ' ') {
+    ++i;
+  }
+  if (i < b.size() && b[i] == '|') {
+    return d;
+  }
+  std::size_t h = 0;
+  while (h < b.size() && h < 6 && b[h] == '#') {
+    ++h;
+  }
+  if (h > 0) {
+    if (h == b.size()) {
+      return d;
+    }
+    if (b[h] == ' ') {
+      d.kind    = LineDecision::Kind::Heading;
+      d.level   = static_cast<int>(h);
+      d.body_at = h + 1;
+      return d;
+    }
+    d.kind    = LineDecision::Kind::Plain;
+    d.body_at = 0;
+    return d;
+  }
+  if (b[0] == '>') {
+    for (std::size_t k = 0; k < b.size(); ++k) {
+      if (b[k] != '>') {
+        d.kind    = LineDecision::Kind::Quote;
+        d.body_at = 1;
+        if (b.size() > 1 && b[1] == ' ') {
+          d.body_at = 2;
+        }
+        return d;
+      }
+    }
+    return d;
+  }
+  std::string_view rest(b.data() + i, b.size() - i);
+  if (rest.empty()) {
+    return d;
+  }
+  const char m = rest[0];
+  if (m == '-' || m == '*' || m == '+' || m == '=') {
+    const bool blocky = std::ranges::all_of(rest, [](char c) {
+      return c == '-' || c == '*' || c == '+' || c == '=' || c == ' ';
+    });
+    if (blocky) {
+      return d;
+    }
+    if (rest.size() >= 2 && rest[1] == ' ') {
+      d.kind    = LineDecision::Kind::Bullet;
+      d.indent  = i;
+      d.body_at = i + 2;
+      return d;
+    }
+    d.kind    = LineDecision::Kind::Plain;
+    d.body_at = 0;
+    return d;
+  }
+  std::size_t dig = 0;
+  while (dig < rest.size() && rest[dig] >= '0' && rest[dig] <= '9') {
+    ++dig;
+  }
+  if (dig > 0) {
+    if (dig == rest.size()) {
+      return d;
+    }
+    if (rest[dig] == '.') {
+      if (dig + 1 < rest.size() && rest[dig + 1] == ' ') {
+        d.kind    = LineDecision::Kind::Numbered;
+        d.body_at = i + dig + 2;
+        return d;
+      }
+      if (dig + 1 == rest.size()) {
+        return d;
+      }
+    }
+    d.kind    = LineDecision::Kind::Plain;
+    d.body_at = 0;
+    return d;
+  }
+  d.kind    = LineDecision::Kind::Plain;
+  d.body_at = 0;
+  return d;
+}
+
+void Renderer::commit_line(const std::string & b, const LineDecision & d) {
+  if (!table_buf_.empty() && !in_fence_) {
+    flush_table();
+  }
+  switch (d.kind) {
+    case LineDecision::Kind::Plain:
+      for (char c : b) {
+        inline_feed_char(c);
+      }
+      break;
+    case LineDecision::Kind::Heading:
+      emit_style(cfg_.heading[d.level - 1]);
+      emit_raw(b.substr(0, d.body_at));
+      for (std::size_t k = d.body_at; k < b.size(); ++k) {
+        inline_feed_char(b[k]);
+      }
+      break;
+    case LineDecision::Kind::Quote:
+      emit_style(cfg_.quote);
+      emit_raw(k_quote_gutter);
+      for (std::size_t k = d.body_at; k < b.size(); ++k) {
+        inline_feed_char(b[k]);
+      }
+      break;
+    case LineDecision::Kind::Bullet: {
+      const std::size_t depth  = d.indent / 2;
+      const auto        bullet = k_bullets[std::min(depth, k_bullets.size() - 1)];
+      for (std::size_t k = 0; k < d.indent; ++k) {
+        emit_raw(" ");
+      }
+      emit_raw(bullet);
+      emit_raw(" ");
+      for (std::size_t k = d.body_at; k < b.size(); ++k) {
+        inline_feed_char(b[k]);
+      }
+      break;
+    }
+    case LineDecision::Kind::Numbered:
+      emit_raw(b.substr(0, d.body_at));
+      for (std::size_t k = d.body_at; k < b.size(); ++k) {
+        inline_feed_char(b[k]);
+      }
+      break;
+    case LineDecision::Kind::None:
+      break;
+  }
+}
+
 void Renderer::flush_table() {
   if (table_buf_.empty()) {
     return;
@@ -606,93 +788,105 @@ void Renderer::flush_table() {
 }
 
 void Renderer::emit_inline(std::string_view line) {
-  enum class Span : unsigned char { None, Bold, Italic, Code };
-  Span        span   = Span::None;
-  std::string buffer;
-  buffer.reserve(line.size());
-
-  auto close_span = [&]() {
-    if (!buffer.empty()) {
-      emit_raw(buffer);
-      buffer.clear();
-    }
-    if (span != Span::None) {
-      emit_style(cfg_.reset);
-      span = Span::None;
-    }
-  };
-
-  auto open_span = [&](Span s, const char *code) {
-    if (!buffer.empty()) {
-      emit_raw(buffer);
-      buffer.clear();
-    }
-    emit_style(code);
-    span = s;
-  };
-
-  const std::size_t n = line.size();
-  std::size_t       i = 0;
-  while (i < n) {
-    const char c = line[i];
-
-    if (span == Span::Code) {
-      if (c == '`') {
-        close_span();
-        ++i;
-        continue;
-      }
-      buffer.push_back(c);
-      ++i;
-      continue;
-    }
-
-    if (c == '\\' && i + 1 < n) {
-      buffer.push_back(line[i + 1]);
-      i += 2;
-      continue;
-    }
-
-    if ((c == '*' || c == '_') && i + 1 < n && line[i + 1] == c) {
-      if (span == Span::Bold) {
-        close_span();
-      } else if (span == Span::None) {
-        open_span(Span::Bold, cfg_.bold);
-      } else {
-        buffer.push_back(c);
-        buffer.push_back(c);
-      }
-      i += 2;
-      continue;
-    }
-
-    if (c == '*' || c == '_') {
-      if (span == Span::Italic) {
-        close_span();
-      } else if (span == Span::None) {
-        open_span(Span::Italic, cfg_.italic);
-      } else {
-        buffer.push_back(c);
-      }
-      ++i;
-      continue;
-    }
-
-    if (c == '`') {
-      if (span == Span::None) {
-        open_span(Span::Code, cfg_.code_inline);
-      } else {
-        buffer.push_back(c);
-      }
-      ++i;
-      continue;
-    }
-
-    buffer.push_back(c);
-    ++i;
+  const Span saved_span    = span_;
+  const char saved_pending = inline_pending_;
+  span_           = Span::None;
+  inline_pending_ = 0;
+  for (char c : line) {
+    inline_feed_char(c);
   }
+  inline_flush();
+  span_           = saved_span;
+  inline_pending_ = saved_pending;
+}
 
-  close_span();
+void Renderer::inline_open(Span s, const char * code) {
+  emit_style(code);
+  span_ = s;
+}
+
+void Renderer::inline_close() {
+  if (span_ != Span::None) {
+    emit_style(cfg_.reset);
+    span_ = Span::None;
+  }
+}
+
+void Renderer::inline_feed_char(char c) {
+  if (inline_pending_ != 0) {
+    const char p = inline_pending_;
+    inline_pending_ = 0;
+    if (p == '\\') {
+      emit_raw(std::string_view(&c, 1));
+      return;
+    }
+    if ((p == '*' || p == '_') && c == p) {
+      if (span_ == Span::Bold) {
+        inline_close();
+      } else if (span_ == Span::None) {
+        inline_open(Span::Bold, cfg_.bold);
+      } else {
+        emit_raw(std::string_view(&p, 1));
+        emit_raw(std::string_view(&c, 1));
+      }
+      return;
+    }
+    if (p == '*' || p == '_') {
+      if (span_ == Span::Italic) {
+        inline_close();
+      } else if (span_ == Span::None) {
+        inline_open(Span::Italic, cfg_.italic);
+      } else {
+        emit_raw(std::string_view(&p, 1));
+      }
+    } else {
+      emit_raw(std::string_view(&p, 1));
+    }
+  }
+  if (c == '`') {
+    if (span_ == Span::None) {
+      inline_open(Span::Code, cfg_.code_inline);
+    } else if (span_ == Span::Code) {
+      inline_close();
+    } else {
+      emit_raw("`");
+    }
+    return;
+  }
+  if (c == '\\' && span_ != Span::Code) {
+    inline_pending_ = c;
+    return;
+  }
+  if (c == '*' || c == '_') {
+    if (span_ == Span::Code) {
+      emit_raw(std::string_view(&c, 1));
+    } else {
+      inline_pending_ = c;
+    }
+    return;
+  }
+  emit_raw(std::string_view(&c, 1));
+}
+
+void Renderer::inline_flush() {
+  if (inline_pending_ != 0) {
+    const char p = inline_pending_;
+    inline_pending_ = 0;
+    if (p == '\\') {
+      emit_raw("\\");
+    } else if (p == '*' || p == '_') {
+      if (span_ == Span::Italic) {
+        inline_close();
+      } else if (span_ == Span::None) {
+        inline_open(Span::Italic, cfg_.italic);
+      } else {
+        emit_raw(std::string_view(&p, 1));
+      }
+    } else {
+      emit_raw(std::string_view(&p, 1));
+    }
+  }
+  inline_close();
 }
 
 std::string Renderer::render(std::string_view markdown, Config cfg) {

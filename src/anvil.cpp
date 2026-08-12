@@ -75,7 +75,7 @@ inline const char * ANVIL_LOGO = R"(
 ░██    ░██ ░██    ░██   ░██░██   ░██░██
 ░██    ░██ ░██    ░██    ░███    ░██░██
 )";
-inline const char * ANVIL_VERSION = "0.6.0";
+inline const char * ANVIL_VERSION = "0.8.0";
 inline const int    CONFIG_VERSION = 2;
 
 inline volatile sig_atomic_t g_interrupted = 0;
@@ -1827,15 +1827,25 @@ std::string capture(const std::string & cmd) {
 inline std::string g_hf_token;
 static volatile sig_atomic_t g_serve_stop = 0;
 
+static std::string shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (const char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
 static std::string auth_flag() {
     if (g_hf_token.empty()) return "";
-    return " -H \"Authorization: Bearer " + g_hf_token + "\"";
+    return " -H " + shell_quote("Authorization: Bearer " + g_hf_token);
 }
 
 std::string http_get(const std::string & url, const std::string & extra_flags = "") {
-    std::string out = capture("curl -fsSL --max-time 60 " + extra_flags + auth_flag() + " \"" + url + "\"");
+    std::string out = capture("curl -fsSL --max-time 60 " + extra_flags + auth_flag() + " " + shell_quote(url));
     if (out.empty()) {
-        out = capture("wget -qO- --timeout=60 --header=\"Authorization: Bearer " + g_hf_token + "\" \"" + url + "\"");
+        out = capture("wget -qO- --timeout=60 --header=" + shell_quote("Authorization: Bearer " + g_hf_token) + " " + shell_quote(url));
     }
     return out;
 }
@@ -1855,8 +1865,8 @@ int http_download(const std::string & url, const std::string & out_path,
     }
 
     std::string cmd = std::string("curl --fail --location --progress-bar --retry 3 --retry-delay 2 ") +
-                      "--connect-timeout 20 --continue-at - " + auth_flag() + " -o \"" +
-                      part + "\" \"" + url + "\"";
+                      "--connect-timeout 20 --continue-at - " + auth_flag() + " -o " +
+                      shell_quote(part) + " " + shell_quote(url);
     const int rc = system(cmd.c_str());
     if (rc != 0) {
         fprintf(stderr, "\033[31mpull failed (curl exit %d). Partial download kept at %s — retry to resume.\033[0m\n",
@@ -1874,10 +1884,10 @@ int http_download(const std::string & url, const std::string & out_path,
 }
 
 std::string sha256_of(const std::string & path) {
-    std::string hex = capture("sha256sum \"" + path + "\" | awk '{print $1}'");
+    std::string hex = capture("sha256sum " + shell_quote(path) + " | awk '{print $1}'");
     while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) hex.pop_back();
     if (!hex.empty()) return hex;
-    hex = capture("shasum -a 256 \"" + path + "\" | awk '{print $1}'");
+    hex = capture("shasum -a 256 " + shell_quote(path) + " | awk '{print $1}'");
     while (!hex.empty() && (hex.back() == '\n' || hex.back() == '\r')) hex.pop_back();
     return hex;
 }
